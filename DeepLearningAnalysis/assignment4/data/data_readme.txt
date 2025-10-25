@@ -1,0 +1,2 @@
+Data for this assignment is too large to reasonably push into repository. 
+It can be downloaded under this link: https://www.clarin.si/repository/xmlui/bitstream/handle/11356/1912/ParlaMint-AT.tgz?sequence=1&isAllowed=y
