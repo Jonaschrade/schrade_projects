@@ -1,41 +1,20 @@
 """
-Pairwise discussion runner for the network simulation.
+Discussion runner: alternating gated turns (Agent.respond), then the reward.
 
-Runs one asymmetric discussion: alternating gated LLM turns (Agent.respond,
-Step B), then the reward product. Every turn enters the conversation on-stance or
-ambiguous, never the opposite stance, and carries a gate record (draft texts,
-per-draft expressed stance and graded value, cascade stage). The reward for each
-speaker is the product of two graded expressions already classified in those gate
-records, r = graded(expresser) * graded(reaction) (agent.reward_from_expressions);
-no extra LLM call is made here. Gating the responder matters as much as the
-expresser: the reaction's graded stance should come from a stance-coherent partner.
-
-reward_a drives the expresser's Q-update (indexed on gate_final_expressed_a)
-and, when GRAPH_DYNAMIC, the edge valuation; reward_b is computed but unused
-(the update is asymmetric by design). Both consequences fire only on a
-measured-reward round and freeze together on a no-signal round (abstention or
-None reward). See README "SFT expression gate" and "Two reward signals".
-
-On the first meeting the expresser responds to the moderator's topic; on repeat
-meetings the caller passes prior_b_message so the exchange continues the
-dialogue. The topic is always forwarded via the stance hint. Reward stays
-causally separate from generation: each graded factor is an independent,
-context-free classification of a single turn (Chuang et al. 2024).
+Each reward is the product of two graded stances already in the gate records,
+r = graded(expresser) * graded(reaction), so no extra LLM call is made. The
+responder is gated too, so the reaction comes from a stance-coherent partner.
+See README "Two reward signals".
 """
 
 from __future__ import annotations
 
 from agents.agent import Agent, reward_from_expressions
+from config import TOPIC_OPENER_TOPIC_FIRST
 
 
 def gate_summary(attempts: int, fallback: bool) -> str:
-    """One-line console summary of a turn's expression-gate outcome.
-
-    Shared by both entry points so the gate line reads identically in
-    network and pairwise mode.  ``attempts`` is the total draft count for
-    the turn (1 = first draft passed); ``fallback`` flags whether the
-    cascade left the soft-prompt stage.
-    """
+    """One-line console summary of a turn's gate outcome, shared by both entry points."""
     return f"gate: {attempts} attempt(s){', fallback' if fallback else ''}"
 
 
@@ -49,68 +28,32 @@ def run_discussion(
     *,
     softmax_a: int,
     softmax_b: int,
+    cue_a: float | None = None,
+    cue_b: float | None = None,
     prior_b_message: str | None = None,
 ) -> dict:
-    """Run a pairwise discussion between two agents and collect reward signals.
+    """Run one discussion and collect the rewards.
 
-    Begins with a moderator message containing ``topic``; agents then alternate
-    for ``turns_per_agent × 2`` gated turns, each anchored to the agent's softmax
-    stance (``softmax_a`` / ``softmax_b``). When ``prior_b_message`` is given it
-    is appended after the moderator opening, so agent_a's first turn continues
-    from agent_b's last message instead of reacting to the moderator. After the
-    last turn each speaker's reward is formed as the product of its own first
-    turn's graded stance and the partner's last turn's graded stance, both read
-    off the gate records (no additional LLM call).
-
-    Parameters
-    ----------
-    agent_a, agent_b:
-        Participants. agent_a speaks first (turns 0, 2, …), agent_b second.
-    topic:
-        Opening moderator message seeding the conversation.
-    topic_label:
-        Short identifier for the topic.
-    turns_per_agent:
-        Turns each agent takes. Default 1 (one asymmetric exchange).
-    verbose:
-        When True, each reply is printed to stdout.
-    softmax_a, softmax_b:
-        Softmax-drawn stances (+1 or −1) from draw_softmax_stance(); anchor the
-        prompts and arbitrate the gate. Required.
-    prior_b_message:
-        agent_b's last message in a previous exchange, or None on first meeting.
+    The moderator's ``topic`` opens the transcript; with ``prior_b_message`` the
+    expresser answers agent_b's last message instead (a repeat meeting). Agents
+    alternate for ``turns_per_agent × 2`` gated turns. Each speaker's cue reaches
+    only its own turns.
 
     Returns
     -------
-    dict with keys:
-        ``turns`` : list of {"speaker", "content", "gate"} dicts (excl.
-            moderator); each ``gate`` is the turn's full gate record.
-        ``reward_a`` / ``reward_b`` : float in [−1, 1] or None. reward_a is
-            graded(agent_a's first) × graded(agent_b's last reaction); reward_b is
-            None unless turns_per_agent >= 2 (with one turn each, agent_a speaks
-            before agent_b, so its message cannot react to agent_b). None means the
-            reaction was UNRELATED/unparseable: skip the TD update, do not treat it
-            as a genuine zero (a genuine ambivalent reaction gives 0.0, not None).
-        ``softmax_a`` / ``softmax_b`` : int, echoed for the logger.
-        ``gate_attempts_a`` / ``gate_attempts_b`` : int, drafts the first turn needed.
-        ``gate_fallback_a`` / ``gate_fallback_b`` : bool, first turn reached the
-            fallback cascade (incl. the fixed-template stage 3).
-        ``gate_final_expressed_a`` / ``gate_final_expressed_b`` : int, expressed
-            stance sign of the accepted first turn; the caller indexes the Q-update
-            on it and skips when 0 (abstention).
-        ``gate_final_graded_a`` / ``gate_final_graded_b`` : float in [−1, 1], graded
-            stance of the accepted first turn (the reward factors); sign equals the
-            corresponding gate_final_expressed_*.
-        ``topic_label`` : str.
+    dict with ``turns`` ({speaker, content, gate} each), ``reward_a`` /
+    ``reward_b`` (float or None; reward_b needs turns_per_agent >= 2, since with
+    one turn each agent_a cannot react to agent_b), ``opener_topic_first``, the
+    echoed ``softmax_*`` / ``cue_*``, and for each agent's first turn
+    ``gate_attempts_*``, ``gate_fallback_*``, ``gate_final_expressed_*`` (the
+    Q-update index) and ``gate_final_graded_*`` (the reward factor).
     """
-    transcript: list[dict] = [{"speaker": "Moderator", "content": f"{topic}."}]
+    transcript: list[dict] = [{"speaker": "Moderator", "content": topic}]
     if prior_b_message is not None:
         transcript.append({"speaker": agent_b.name, "content": prior_b_message})
 
     total_turns = turns_per_agent * 2
 
-    # Each agent's first turn provides the gate convenience fields below,
-    # captured here so the result dict need not dig through the turn list.
     gate_a_first: dict | None = None
     gate_b_first: dict | None = None
 
@@ -119,14 +62,17 @@ def run_discussion(
         if i % 2 == 0:
             speaker = agent_a
             softmax_stance = softmax_a
+            cue = cue_a
         else:
             speaker = agent_b
             softmax_stance = softmax_b
+            cue = cue_b
 
         last = transcript[-1]
         reply, gate = speaker.respond(
             last["content"], last["speaker"],
             softmax_stance=softmax_stance,
+            cue=cue,
         )
         if i == 0:
             gate_a_first = gate
@@ -137,18 +83,8 @@ def run_discussion(
         transcript.append({"speaker": speaker.name, "content": reply})
         turns.append({"speaker": speaker.name, "content": reply, "gate": gate})
 
-    # Reward as the product of graded expressions r = graded(expresser) *
-    # graded(reaction), the o_i * o_j form (see agent.reward_from_expressions):
-    #   reward_a: agent_a's first expression vs agent_b's last reaction.
-    #             Valid for all turns_per_agent >= 1 (agent_b always speaks after agent_a).
-    #   reward_b: agent_b's first expression vs agent_a's last reaction.
-    #             Requires turns_per_agent >= 2: agent_a must speak again *after* agent_b
-    #             for its last turn to be a genuine reaction. With turns_per_agent=1
-    #             agent_a's only message precedes agent_b's, so reward_b is causally
-    #             inverted and is set to None instead of being computed and misread as
-    #             valid feedback.
-    # The graded stance of each turn is already classified in its gate record, so
-    # no additional LLM call is made here.
+    # reward_a: agent_a's first turn × agent_b's last reaction. reward_b mirrors it
+    # and is None at one turn each, where agent_a's turn precedes agent_b's.
     graded_a_first = gate_a_first["final_expressed_graded"]
     graded_b_last = next(
         t["gate"]["final_expressed_graded"]
@@ -183,11 +119,14 @@ def run_discussion(
 
     return {
         "topic_label":            topic_label,
+        "opener_topic_first":     topic == TOPIC_OPENER_TOPIC_FIRST,
         "turns":                  turns,
         "reward_a":               reward_a,
         "reward_b":               reward_b,
         "softmax_a":              softmax_a,
         "softmax_b":              softmax_b,
+        "cue_a":                  cue_a,
+        "cue_b":                  cue_b,
         "gate_attempts_a":        gate_a_first["n_attempts"],
         "gate_fallback_a":        gate_a_first["fallback_used"],
         "gate_final_expressed_a": gate_a_first["final_expressed"],

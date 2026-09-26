@@ -1,55 +1,73 @@
 """
-Structured logging for the network simulation.
+Structured run output under ``logs/run_<id>/`` (README "Output"):
 
-All events are written to a timestamped run directory under ``logs/``. Two
-formats are produced:
-
-* ``events.jsonl``: one JSON object per line, covering every discussion, edge
-  lifecycle event, and reflection trigger. Suitable for streaming or replay.
-* ``network_rounds/round_NNNN.json``: a full snapshot of the network state after
-  each round (edge list with metadata, graph metrics, optional
-  ``extra_metrics`` for extension data such as Banisch polarisation measures).
-
-Extension point
----------------
-Pass ``extra_metrics=compute_polarization_metrics(state.opinion_states)`` and
-``opinion_states=opinion_states_to_dict(state.opinion_states, softmax_stances)``
-to ``snapshot_network`` to include SFT metrics and Q-trajectories in each
-snapshot (see ``main_network.py``). Per-draft expressed stances are not
-snapshotted here; they live in the gate records on each ``discussion`` turn
-(see ``network/discussion.py`` and ``analyze_gate.py``).
+* ``params.json``: resolved parameters plus commit, model digest and Ollama
+  version; the authority on what a run computed.
+* ``personas.json``: the agents and their persona texts.
+* ``events.jsonl``: one record per discussion, edge event and reflection; turns
+  carry their gate records (read back by analysis/metrics.load_gate).
+* ``network_rounds/round_NNNN.json``: graph, metrics and Q-states after each round.
 """
 
 from __future__ import annotations
 
 import json
+import subprocess
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 import networkx as nx
 
 from network.state import NetworkState
 
+_REPO = Path(__file__).resolve().parents[2]
+
+
+def _git_commit() -> str:
+    """The commit the run started from, suffixed "-dirty" on uncommitted changes.
+
+    Never raises: provenance must not be able to fail a run.
+    """
+    try:
+        head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=_REPO,
+                              capture_output=True, text=True, check=True,
+                              timeout=10).stdout.strip()
+        dirty = subprocess.run(["git", "status", "--porcelain"], cwd=_REPO,
+                               capture_output=True, text=True, check=True,
+                               timeout=10).stdout.strip()
+        return f"{head}-dirty" if dirty else head
+    except (subprocess.SubprocessError, OSError):
+        return "unknown"
+
+
+def _model_digest(model: str, host: str) -> str:
+    """Digest of the served weights from /api/tags, or "unreachable" / "not-served"."""
+    try:
+        with urllib.request.urlopen(f"http://{host}/api/tags", timeout=5) as fh:
+            served = json.loads(fh.read()).get("models", [])
+    except (urllib.error.URLError, OSError, json.JSONDecodeError, TimeoutError):
+        return "unreachable"
+    # Exact tag only: a family match could record another size's digest.
+    wanted = {model, f"{model}:latest"} if ":" not in model else {model}
+    for entry in served:
+        if entry.get("name", "") in wanted:
+            return entry.get("digest", "unknown")
+    return "not-served"
+
+
+def _ollama_version(host: str) -> str:
+    """The Ollama server version (the runtime the digest does not pin), or "unreachable"."""
+    try:
+        with urllib.request.urlopen(f"http://{host}/api/version", timeout=5) as fh:
+            return json.loads(fh.read()).get("version", "unknown")
+    except (urllib.error.URLError, OSError, json.JSONDecodeError, TimeoutError):
+        return "unreachable"
+
 
 class SimulationLogger:
-    """Writes structured simulation output to a per-run directory.
-
-    Output directory layout::
-
-        logs/
-        └-- run_<timestamp>/
-            ├-- events.jsonl          # one JSON record per event
-            └-- network_rounds/
-                ├-- round_0000.json   # pre-simulation snapshot
-                ├-- round_0001.json
-                └-- ...
-
-    Parameters
-    ----------
-    run_id:
-        Optional string identifier for the run directory name.  Defaults to
-        the Unix timestamp at construction time.
-    """
+    """Writes one run's output to ``logs/run_<run_id>/`` (run_id defaults to a timestamp)."""
 
     def __init__(self, run_id: str | None = None) -> None:
         ts = run_id or str(int(time.time()))
@@ -73,22 +91,7 @@ class SimulationLogger:
     # -- public logging methods ----------------------------------------------
 
     def log_personas(self, agents: dict) -> None:
-        """Write all agent personas to ``personas.json`` in the run directory.
-
-        Called once at startup so that every run has a persistent record of
-        which agents participated and what their persona descriptions were.
-        This allows post-hoc correlation of agent behaviour with persona
-        attributes even if the console output is lost.
-
-        Output path: ``logs/run_<timestamp>/personas.json``
-
-        Parameters
-        ----------
-        agents:
-            Mapping of agent name to ``Agent`` instance, as used throughout
-            the simulation.  Each entry's ``name`` and ``persona`` attributes
-            are written; all other state is ignored.
-        """
+        """Write each agent's name and persona to ``personas.json``."""
         records = [
             {"name": name, "persona": agent.persona}
             for name, agent in agents.items()
@@ -99,6 +102,40 @@ class SimulationLogger:
             encoding="utf-8",
         )
 
+    def log_params(self) -> None:
+        """Write the resolved parameters and provenance to ``params.json``.
+
+        No run reproduces bitwise, so code, weights and runtime travel with the
+        parameters (final_schedule.md § Reproducibility contract).
+        """
+        import config as _c
+
+        keys = [
+            "NUM_AGENTS", "INTERACTIONS_PER_ROUND", "NETWORK_MAX_ROUNDS",
+            "SBM_NUM_COMMUNITIES", "SBM_M_INTRA", "SBM_M_INTER",
+            "SBM_PAIRS_INTRA", "SBM_PAIRS_INTER",
+            "SBM_P_INTRA", "SBM_P_INTER",
+            "LEARNING_RATE", "OPINION_BETA", "RESPONDER_SELECTION_BETA",
+            "GRAPH_DYNAMIC", "REWIRE_RULE", "REWIRE_BETA",
+            "REWIRE_TIMESCALE_RATIO", "STRENGTH_DELTA", "STRENGTH_CAP",
+            "STRENGTH_FLOOR", "INITIAL_EDGE_STRENGTH", "NEW_EDGE_STRENGTH",
+            "REWARD_WINDOW_M", "MEMORY_ENABLED", "REFLECT_EVERY",
+            "MAX_MEMORIES_RETRIEVE", "MAX_MEMORIES_SEED",
+            "SFT_GATE_ENABLED", "CONVICTION_CUE_ENABLED", "STANCE_BRIDGE_ENABLED",
+            "LLM_MODEL", "LLM_NUM_CTX",
+            "TOPIC_KEY", "TOPIC_LABEL", "TOPIC_TEXT", "TOPIC_TEXT_OPPOSITE",
+            "TOPIC_OPENER", "TOPIC_OPENER_SWAPPED", "SEED",
+        ]
+        params = {k: getattr(_c, k) for k in keys if hasattr(_c, k)}
+        params["run_id"] = self.run_dir.name
+        params["git_commit"] = _git_commit()
+        params["model_digest"] = _model_digest(_c.LLM_MODEL, _c.OLLAMA_HOST)
+        params["ollama_version"] = _ollama_version(_c.OLLAMA_HOST)
+        (self.run_dir / "params.json").write_text(
+            json.dumps(params, ensure_ascii=False, indent=2, default=str),
+            encoding="utf-8",
+        )
+
     def log_discussion(
         self,
         round_n: int,
@@ -106,21 +143,7 @@ class SimulationLogger:
         agent_b: str,
         result: dict,
     ) -> None:
-        """Log the outcome of one pairwise discussion.
-
-        Parameters
-        ----------
-        round_n:
-            Simulation round in which the discussion took place.
-        agent_a:
-            Name of the first participant.
-        agent_b:
-            Name of the second participant.
-        result:
-            The dict returned by ``network.discussion.run_discussion``.
-            Keys ``topic_label``, ``turns``, ``reward_a``, ``reward_b``
-            are included verbatim.
-        """
+        """Log one discussion: expresser agent_a, responder agent_b, and run_discussion's result verbatim."""
         self._write({
             "type":    "discussion",
             "round":   round_n,
@@ -137,22 +160,11 @@ class SimulationLogger:
         agent_b: str,
         **kwargs,
     ) -> None:
-        """Log an edge lifecycle event.
+        """Log an edge event (types: README "Output").
 
-        Parameters
-        ----------
-        round_n:
-            Current simulation round.
-        event_type:
-            One of ``"edge_maintained"``, ``"edge_dropped"``, or
-            ``"edge_added"`` (for reconnection events).
-        agent_a:
-            Name of one endpoint.
-        agent_b:
-            Name of the other endpoint.
-        **kwargs:
-            Any additional fields to include in the record (e.g.
-            ``strength=1.2``).
+        For edge_dropped / edge_rewired, agent_a is the initiator. edge_dropped's
+        kwargs record the decision: each side's rolling signal and post-step
+        valuation, so a cut on negative feedback is distinguishable from drift.
         """
         self._write({
             "type":    event_type,
@@ -163,20 +175,7 @@ class SimulationLogger:
         })
 
     def log_reflection(self, round_n: int, agent_name: str) -> None:
-        """Log that reflection was triggered for an agent.
-
-        The content of the reflection (insights) is printed to stdout by
-        ``Agent.reflect()`` directly.  This event records only the trigger,
-        allowing downstream analysis to correlate reflection rounds with
-        network changes.
-
-        Parameters
-        ----------
-        round_n:
-            Current simulation round.
-        agent_name:
-            Name of the agent that reflected.
-        """
+        """Log a reflection trigger; the insights themselves go to stdout only."""
         self._write({
             "type":  "reflection",
             "round": round_n,
@@ -189,31 +188,11 @@ class SimulationLogger:
         extra_metrics: dict | None = None,
         opinion_states: dict | None = None,
     ) -> None:
-        """Write a full network snapshot for the current round.
+        """Write ``network_rounds/round_NNNN.json`` for the current round.
 
-        The snapshot contains the complete edge list (with strength and
-        activity count), basic graph metrics, SFT polarization metrics,
-        and per-agent Q-value trajectories. When the graph carries SBM
-        ``"community"`` node attributes (network mode), a top-level
-        ``"communities"`` map (agent name -> community index) and the
-        ``n_intra_edges`` / ``n_inter_edges`` metrics are included in every
-        snapshot, enabling per-community regime classification post-hoc.
-
-        Output path: ``network_rounds/round_NNNN.json``
-
-        Parameters
-        ----------
-        state:
-            The current ``NetworkState``.
-        extra_metrics:
-            Optional dict of scalar metrics to merge into the ``"metrics"``
-            section (e.g. SFT polarization measures: n_pos, n_neg,
-            dispersion, mean_q_gap).
-        opinion_states:
-            Optional dict of per-agent Q-value snapshots, as returned by
-            ``network.opinion.opinion_states_to_dict()``.  Stored as a
-            top-level ``"opinion_states"`` field in the snapshot so that
-            Q-trajectories can be reconstructed from the log files.
+        Edges, graph metrics merged with ``extra_metrics``, and
+        ``opinion_states``; with "community" node attributes (network mode) also
+        the community map and intra/inter edge counts.
         """
         edges = [
             {
@@ -235,8 +214,6 @@ class SimulationLogger:
             "n_edges":      state.graph.number_of_edges(),
         }
 
-        # SBM community membership (absent in pairwise mode, where the graph
-        # has no "community" node attribute).
         communities = nx.get_node_attributes(state.graph, "community")
         if communities:
             n_intra = sum(
@@ -252,7 +229,6 @@ class SimulationLogger:
         snapshot: dict = {
             "round":      state.round,
             "elapsed_s":  round(self.elapsed(), 2),
-            "idle_agent": state.idle_agent,
             "nodes":      list(state.agents.keys()),
             "edges":      edges,
             "metrics":    metrics,

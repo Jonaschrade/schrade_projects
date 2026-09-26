@@ -10,15 +10,13 @@ Public API
 AgentOpinionState             dataclass: Q-values + argmax_stance + q_gap
 init_opinion_states()         initialise one state per agent
 draw_softmax_stance()         stochastic stance draw (β-parameterised)
+conviction_cue()              conviction in a stance, on [0, 1], for the prompt
 update_q_value()              apply TD update for a given stance
 opinion_states_to_dict()      serialise for logging (argmax + optional softmax)
 compute_polarization_metrics()  population-level SFT metrics
 
-Two stance quantities exist per agent per interaction: the argmax stance
-(deterministic argmax over Q-values; metrics, logging, console) and the softmax
-stance (drawn by draw_softmax_stance() for a specific interaction, anchoring
-respond()). What each draft actually expressed lives in the gate records; the
-main loops index the TD update on final_expressed. See README "Terminology".
+Argmax stance (metrics, logging) vs. softmax stance (the per-interaction draw that
+anchors respond()): README "Terminology".
 """
 
 from __future__ import annotations
@@ -29,19 +27,10 @@ from dataclasses import dataclass
 
 @dataclass
 class AgentOpinionState:
-    """SFT internal state: Q-values over the two opinion stances.
+    """SFT internal state: Q(+1) and Q(-1), both starting at 0.0.
 
-    Attributes
-    ----------
-    q_pos:
-        Q(+1): perceived social value of expressing the pro-stance.
-        Updated whenever the agent expresses +1 and receives feedback.
-    q_neg:
-        Q(−1): perceived social value of expressing the contra-stance.
-        Updated whenever the agent expresses −1 and receives feedback.
-
-    Both values start at 0.0 so neither stance is initially preferred,
-    and the social environment drives divergence over rounds.
+    Neutral start keeps model priors out of the first step: any divergence is
+    caused by social feedback.
     """
 
     q_pos: float = 0.0
@@ -49,12 +38,7 @@ class AgentOpinionState:
 
     @property
     def argmax_stance(self) -> int:
-        """Deterministic argmax over Q-values; ties resolve to +1.
-
-        The indicator used for metrics and logging: the stance the agent would
-        prefer, not necessarily the one drawn (draw_softmax_stance, which can
-        differ at low conviction) or expressed in a given interaction.
-        """
+        """Deterministic argmax over Q-values; ties resolve to +1."""
         return 1 if self.q_pos >= self.q_neg else -1
 
     @property
@@ -74,26 +58,10 @@ def update_q_value(
     reward: float,
     alpha: float,
 ) -> None:
-    """Temporal-difference update for the Q-value of ``stance``.
+    """TD update Q(stance) ← (1 − α) · Q(stance) + α · r (Banisch & Olbrich 2019).
 
-    SFT rule (Banisch & Olbrich 2019): Q(o_i) ← (1 − α) · Q(o_i) + α · r. Only
-    ``stance``'s Q-value is updated; the other receives no feedback. ``stance``
-    must be the stance that entered the interaction (the reward responds to what
-    was said): callers pass the expresser's ``gate_final_expressed`` and call
-    this only when it is non-zero (an ambiguous expression is a strategic
-    abstention, skipped upstream). Under the gate that stance is the softmax
-    draw; in the ungated arm it is the classified expressed stance.
-
-    Parameters
-    ----------
-    opinion:
-        The agent's current opinion state. Mutated in place.
-    stance:
-        Stance (+1 or −1) whose Q-value receives the update.
-    reward:
-        Social feedback scalar r ∈ [−1.0, 1.0]. Positive = agreement.
-    alpha:
-        Learning rate α (LEARNING_RATE in config.py).
+    ``stance`` must be the stance that entered the interaction: callers pass the
+    expresser's non-zero ``gate_final_expressed``. Mutates ``opinion``.
     """
     if stance == 1:
         opinion.q_pos = (1 - alpha) * opinion.q_pos + alpha * reward
@@ -101,31 +69,30 @@ def update_q_value(
         opinion.q_neg = (1 - alpha) * opinion.q_neg + alpha * reward
 
 
+def conviction_cue(opinion: AgentOpinionState, stance: int) -> float:
+    """How settled the agent is about ``stance``: max(0, stance * q_gap) / 2 in [0, 1].
+
+    Carries the magnitude of Q into the prompt where the softmax draw carries only
+    its sign (README "The conviction cue"). ``stance`` is required: an off-argmax
+    draw argues the lower-valued pole, and the clamp sends it to band 0. Linear,
+    because q_gap is bounded in [-2, 2] by the update rule itself.
+    """
+    return max(0.0, stance * opinion.q_gap) / 2.0
+
+
 def draw_softmax_stance(opinion: AgentOpinionState, beta: float) -> int:
-    """Draw a softmax stance via softmax with inverse temperature β.
+    """Draw +1 or -1 with p(+1) = σ(β · q_gap).
 
-    Uses the logistic (sigmoid) form, which is equivalent to a two-class
-    softmax and numerically stable:
-
-        p(+1) = σ(β · (q_pos − q_neg)) = 1 / (1 + exp(−β · Δq))
-
-    β = 0  → p(+1) = 0.5  (uniform random, fixes tied-Q init artifact)
-    β > 0  → p(+1) > 0.5 when q_pos > q_neg
-    β → ∞  → deterministic argmax
-
-    Parameters
-    ----------
-    opinion:
-        Current Q-value state.
-    beta:
-        Inverse temperature β ≥ 0.
-
-    Returns
-    -------
-    int
-        +1 or −1.
+    β = 0 gives a fair coin; β = inf is special-cased as sign(q_gap), because
+    the sigmoid is nan there at q_gap = 0, and an exact tie stays a fair draw
+    rather than argmax_stance's tie-break to +1. A large finite β can overflow
+    math.exp.
     """
     import random
+    if math.isinf(beta):
+        if opinion.q_gap == 0.0:
+            return random.choice((1, -1))
+        return 1 if opinion.q_gap > 0 else -1
     p_pos = 1.0 / (1.0 + math.exp(-beta * opinion.q_gap))
     return 1 if random.random() < p_pos else -1
 
@@ -134,20 +101,10 @@ def opinion_states_to_dict(
     opinion_states: dict[str, AgentOpinionState],
     softmax_stances: dict[str, int] | None = None,
 ) -> dict[str, dict]:
-    """Serialise opinion states for JSON logging.
+    """Serialise opinion states for the round snapshot.
 
-    Parameters
-    ----------
-    opinion_states:
-        Mapping of agent name to AgentOpinionState.
-    softmax_stances:
-        Optional mapping of agent name to the softmax-drawn stance for the
-        current round.  When provided, each agent entry gains a
-        ``"softmax"`` key with the interaction-level draw alongside the
-        deterministic ``"argmax"`` indicator.  Agents absent from this dict
-        (e.g. never selected as expresser in the round) receive no
-        ``"softmax"`` key. Per-draft expressed stances are not snapshotted here;
-        they live in the gate records logged with each turn (network/discussion.py).
+    ``softmax_stances`` adds each agent's last draw as expresser this round;
+    agents that never expressed get no ``"softmax"`` key.
     """
     result = {}
     for name, s in opinion_states.items():
@@ -166,28 +123,11 @@ def opinion_states_to_dict(
 def compute_polarization_metrics(
     opinion_states: dict[str, AgentOpinionState],
 ) -> dict:
-    """Population-level polarization metrics aligned with Banisch & Olbrich (2019).
+    """Population-level metrics (Banisch & Olbrich 2019).
 
-    Parameters
-    ----------
-    opinion_states:
-        Mapping of agent name to AgentOpinionState.
-
-    Returns
-    -------
-    dict with keys:
-        n_pos : int
-            Agents with a strict positive Q-gap (q_pos > q_neg).
-        n_neg : int
-            Agents with a strict negative Q-gap (q_neg > q_pos).
-            Agents with equal Q-values (neutral/tied) are excluded from both
-            counts; n_pos + n_neg ≤ total agents.
-        dispersion : float
-            Variance of argmax stances in {−1, +1}. 0 (full consensus) to 1
-            (maximally split population).
-        mean_q_gap : float
-            Mean |Q(+1) − Q(−1)| across agents: average certainty of the argmax
-            stance. High values indicate committed opinions.
+    Returns n_pos / n_neg (strict Q-gap sign; tied agents in neither), dispersion
+    (variance of argmax stances, 0 = consensus, 1 = even split) and mean_q_gap
+    (mean |q_gap|).
     """
     if not opinion_states:
         return {}

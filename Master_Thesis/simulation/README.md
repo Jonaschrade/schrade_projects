@@ -1,19 +1,15 @@
 # Multi-Agent Deliberation Simulation
 
-A thesis research project implementing a hybrid LLM + Social Feedback Theory (SFT) simulation of opinion dynamics in structured social networks, powered by local LLMs via [Ollama](https://ollama.ai).
+A hybrid LLM + Social Feedback Theory (SFT; Banisch & Olbrich 2019) simulation of opinion dynamics on a structured network, run on local models via [Ollama](https://ollama.ai).
 
-**Research question:** Can Social Feedback Theory serve as underlying reinforcement-learning mechanism for LLM agents embedded in a structured social network such that the resulting hybrid model preserves SFT's analytic interpretability while extending the empirical scope?
-
-The project provides two simulation modes:
+**Research question:** Can Social Feedback Theory serve as the underlying reinforcement-learning mechanism for LLM agents embedded in a structured social network such that the resulting hybrid model preserves SFT's analytic interpretability while extending the empirical scope?
 
 | Mode | Entry point | Description |
 |---|---|---|
-| **Network** | `main_network.py` | N agents in an SBM graph; asymmetric interactions; Q-values govern opinion expression |
-| **Pairwise** | `main_pairwise.py` | Two agents connected by a single edge; same SFT mechanisms as network mode (Q-values, softmax β, responder selection, reward recording, edge dynamics); no SBM graph or community structure |
+| **Network** | `main_network.py` | N agents on a two-block graph; the canonical driver |
+| **Pairwise** | `main_pairwise.py` | The same mechanism for two agents on a single edge |
 
-Network mode is the canonical simulation driver for multi-agent experiments. Pairwise mode runs the identical SFT mechanisms for exactly two agents on a single-edge graph.
-
-No LangGraph. No OpenAI. Local Ollama only (`qwen3.5:35b`). Embeddings via `sentence-transformers` (CPU, no Ollama dependency).
+Local Ollama only (`qwen3.8-nodraft:27b`; the pilot ran `qwen3.5:35b`), no orchestration framework ([why](#what-not-to-change-without-good-reason)). Embeddings via `sentence-transformers` on CPU.
 
 ---
 
@@ -21,14 +17,16 @@ No LangGraph. No OpenAI. Local Ollama only (`qwen3.5:35b`). Embeddings via `sent
 
 | Term | Definition |
 |---|---|
-| **Turn** | One `respond()` call, one agent speaks once |
-| **Exchange** | One full back-and-forth, both agents speak once (2 turns) |
-| **Interaction** | One asymmetric event: one expresser drawn, one responder drawn, one exchange, one Q-update for the expresser only |
-| **Round** | `INTERACTIONS_PER_ROUND` interactions; the snapshotting unit |
-| **Discussion** | One asymmetric interaction in both modes: 1 exchange (expresser speaks, responder reacts) |
-| **Argmax stance** | `argmax(q_pos, q_neg)`, deterministic, the stance an agent would prefer given its current Q-values |
-| **Softmax stance** | The stochastic β-softmax draw for a given interaction, anchoring the `respond()` prompt and arbitrating its [expression gate](#sft-expression-gate) |
-| **Expressed stance** | The stance `classify_expression()` reads off a generated draft (+1/−1, or `0` = **ambiguous**). Inside the expression gate it decides whether a draft is accepted; the accepted text's expressed stance (`final_expressed`) is the Q-update index, and when it is `0`/ambiguous the update is skipped (a strategic abstention). "Ambiguous" is reserved for this NL-expression sense; the reward signal's neutral case is "ambivalent" |
+| **Turn** | One `respond()` call: one agent speaks once |
+| **Exchange** | Both agents speak once (2 turns) |
+| **Interaction** | One expresser, one responder, one exchange, one Q-update (expresser only) |
+| **Round** | `INTERACTIONS_PER_ROUND` interactions; the snapshot unit |
+| **Argmax stance** | `argmax(q_pos, q_neg)`: metrics, logging, the `reflect()` anchor |
+| **Softmax stance** | The per-interaction β-softmax draw that anchors `respond()` and arbitrates its [expression gate](#sft-expression-gate) |
+| **Expressed stance** | The sign the classifier reads off a draft: ±1, or `0` = **ambiguous** (an abstention). The accepted draft's sign (`final_expressed`) indexes the Q-update, which is skipped at `0` |
+| **Ambiguous / ambivalent** | *Ambiguous* is an expression with no stance (the expresser abstains); *ambivalent* is a reaction graded `0.0`, a genuine reward `r = 0` |
+
+Schedule terminology (stage / sub-stage / run / cohort) is defined in [`../CLAUDE.md`](../CLAUDE.md) and parsed by `analysis/runs.py`. "Stage" also names the gate's three cascade stages; the two senses are unrelated.
 
 ---
 
@@ -36,223 +34,227 @@ No LangGraph. No OpenAI. Local Ollama only (`qwen3.5:35b`). Embeddings via `sent
 
 ```
 config.py               single source of truth for all constants
-agents/agent.py         Agent class: respond() (+ the SFT expression gate _sft_gate()),
-                        classify_expression_graded()/classify_expression(),
-                        reward_from_expressions(), reflect()
-agents/personas.py      samples survey records, expands to name+persona via LLM
+agents/agent.py         Agent: respond() + the expression gate _sft_gate(), draft(),
+                        reflect(); classify_expression_graded(), graded_stance_prompt(),
+                        stance_score(), reward_from_expressions()
+agents/personas.py      samples GSS survey records, expands them to name + persona via the LLM
 memory/store.py         per-agent ChromaDB collection
-memory/scoring.py       composite score: recency + importance + relevance + stance congruence
-network/opinion.py      SFT Q-value state: AgentOpinionState, draw_softmax_stance(), update_q_value(), metrics
-network/state.py        NetworkState, EdgeData dataclasses
-network/matching.py     select_responder(): reward-weighted partner draw; also compute_pairings(), ensure_connectivity()
-network/discussion.py   run_discussion(): gated exchange loop + reward product; gate_summary()
-network/edges.py        record_reward(): every measured-reward interaction; update_edge(): only when GRAPH_DYNAMIC = True (both frozen on a no-signal round)
-network/logger.py       SimulationLogger: events.jsonl + round_NNNN.json snapshots
-main_network.py         network entry point
-main_pairwise.py        pairwise entry point
-analyze_gate.py         post-hoc persona-field readout from gate records (offline log mining; see below)
-data/                   GSS2024.dta (raw 2024 GSS Release 3 extract), gss_personas.json (persona pool, generated by notebooks/script.ipynb)
-logs/                   simulation output, created at runtime
+memory/scoring.py       composite retrieval score: recency, importance, relevance, stance congruence
+network/opinion.py      Q-state: AgentOpinionState, draw_softmax_stance(), conviction_cue(),
+                        update_q_value(), polarization metrics
+network/state.py        NetworkState, EdgeData, new_edge_data()
+network/matching.py     select_responder() (1-hop), expected_reward_via_referral() and
+                        rewire_after_drop() (2-hop tie formation)
+network/discussion.py   run_discussion(): gated exchange + reward product
+network/edges.py        record_reward(), update_edge()
+network/logger.py       SimulationLogger: params.json, personas.json, events.jsonl, snapshots
+main_network.py, main_pairwise.py   entry points
+run_stage.sh            SGE batch runner, one sub-stage per job (RUNBOOK.md)
+run_sweep.py            local grid sweep
+data/                   GSS2024.dta and the derived gss_personas.json (git-ignored)
 ```
+
+Everything that reads the output lives in [`../analysis/`](../analysis/README.md).
 
 ---
 
 ## SFT architecture
 
-The Q-update rule lives entirely in code. The LLM handles two functions per interaction: generating each agent's utterance through the [expression gate](#sft-expression-gate) (`respond()`, which internally calls `classify_expression_graded()` on each draft to enforce the drawn stance by its sign), and grading where each turn stands on the topic (the same `classify_expression_graded()`). The scalar reward is not a third LLM call but a product of two of those graded stances, `r = graded(expresser) · graded(reaction)` (`reward_from_expressions()`). Every opinion shift traces to an auditable Q-trajectory, not to an opaque LLM forward pass.
+The Q-update lives entirely in code. The LLM generates each utterance through the [expression gate](#sft-expression-gate) and grades each turn's stance (`classify_expression_graded()`); the reward is the product of two such grades, not a further LLM call. Every opinion shift therefore traces to an auditable Q-trajectory.
 
 ### Agent internal state
 
-Each agent holds:
+- **`AgentOpinionState`**: `q_pos`, `q_neg`, both starting at 0, so any divergence is caused by social feedback rather than model priors.
+- **Memory**: a ChromaDB collection of past interactions and reflections, retrieved into `respond()` and `reflect()` prompts.
+- **Persona**: an English profile derived from US GSS data, never stored in memory. It sits verbatim on the identity line (`_identity()`), beside a stance anchor it has not been reconciled with. `STANCE_BRIDGE_ENABLED = True` instead molds persona and stance into a cached per-stance justification (`_mold_stance()`). Either way the anchoring is **soft**: the persona can pull a draft off-stance, the gate rejects the draft, and the pull is logged as first-attempt fidelity. That tension between social-feedback learning and the persona is a study object.
 
-- **`AgentOpinionState`** (`network/opinion.py`), Q-values `q_pos` (Q(+1)) and `q_neg` (Q(−1)), representing accumulated social value of each stance. Two stance quantities are tracked on the opinion state per interaction:
-  - **argmax stance** (`argmax_stance` property), `argmax(q_pos, q_neg)`, deterministic, used for metrics and logging; also anchors the `reflect()` prompts (reflection consolidates the agent's current opinion, not a per-interaction draw).
-  - **softmax stance**: drawn stochastically by `draw_softmax_stance(β)`, anchors the `respond()` prompt and arbitrates its [expression gate](#sft-expression-gate); at low conviction (q_gap near 0) it can diverge from the argmax stance.
+Persona and memory condition generation only; the Q-update sees only the reward and the stance index.
 
-  Both are recorded in the per-round snapshot under `"argmax"` and `"softmax"` keys. What each generated draft *actually expressed* (the **expressed stance**, read by `classify_expression()`) is not on the opinion state; it lives in the per-turn [gate records](#sft-expression-gate) in `events.jsonl`. The Q-update indexes on the accepted draft's expressed stance (`final_expressed`) and is **skipped when it is `0`/ambiguous**: a vague utterance is a strategic abstention (see [expression gate](#sft-expression-gate)).
-- **Memory**: a ChromaDB collection of past interactions and reflections, used to condition `respond()`. The persona is deliberately *not* seeded into memory, so the raw persona text cannot re-enter the stance-anchored prompts via retrieval.
-- **Persona**: an English-language profile derived from US GSS survey data, never stored in memory and never injected directly into the `respond()` or `reflect()` prompts. Instead, `_mold_stance(stance)` combines persona and stance once per possible stance (+1 and −1) into a short, persona-grounded justification, cached by `_derive_stance_bridges()`; `respond()` and `reflect()` only ever see this pre-molded bridge sentence. The persona-stance reconciliation is *attempted* here, once at init; it is deliberately **soft**, and the persona can still pull a draft off the anchored stance at generation time. That pull is **measured** as first-attempt fidelity in the gate records, not prompted away: the tension between social-feedback learning and the persona field is a study object of the thesis (see [expression gate](#sft-expression-gate)).
+### The conviction cue
 
-The persona and memory condition LLM text generation only. The Q-update rule sees only the scalar classifier reward and the stance index derived from the gate record.
+**On in every arm (`CONVICTION_CUE_ENABLED = True`)**; `SIM_CONVICTION_CUE=0` is an ablation that reproduces the uncued prompt byte for byte.
+
+The softmax draw carries the *sign* of Q into the prompt. The cue carries the *magnitude*, so expressed commitment can track learned commitment instead of being a fixed persona trait. `conviction_cue()` returns `max(0, stance × q_gap) / 2`, and `_cue_clause()` bands it into a sub-phrase completing the stance header: *"You currently hold this position with considerable conviction."* A clause rather than a separate sentence, because the generator could drop a separate sentence without breaking anything.
+
+- **The clamp.** `stance` is the pole the prompt anchors to. An off-argmax draw (probability `σ(−β·|Δq|)`) argues the lower-valued pole, so stance-blind `|q_gap|` would claim conviction the agent does not have; the clamp sends that case to band 0. In `reflect()` the anchor is the argmax, so the clamp is inert.
+- **Linear, not `tanh`.** Rewards in `[−1, 1]` and the convex TD update bound `q_gap` to `[−2, 2]` exactly, so the scale belongs to the mechanism and needs no refitting per model. `tanh` would be flat in the early rounds, where the regime is decided.
+- **The bands** are cut at the midpoints of the classifier's magnitude ladder, so cue and instrument share a scale, but they never reuse `SLIGHT`/`PREDOMINANT`/`CLEAR`: `corr(cue, |graded|)` is the manipulation check and must not score lexical echo. No band names the other pole or invites a comparison. The low bands speak of certainty ("unsure", "lean toward"), which is a risk: a hedging draft scores `BALANCED`/`NEITHER`, abstains, freezes the update and keeps the agent in band 0, where every run starts. **Tier 0's band-0 abstention rate gates this wording** before any run is queued.
+
+| Band | Clause | cue | `stance × q_gap` | nearest graded level |
+|---|---|---|---|---|
+| 0 | tentatively; you are unsure about it | `[0, 1/6)` | < 0.33 (and every clamped turn) | 0 |
+| 1 | with some conviction; you lean toward it | `[1/6, 1/2)` | 0.33–1.00 | 1/3 |
+| 2 | with considerable conviction; you are fairly certain of it | `[1/2, 5/6)` | 1.00–1.67 | 2/3 |
+| 3 | with full conviction; you no longer question it | `[5/6, 1]` | 1.67–2.00 | 1 |
+
+**Expected effect: a damper.** LLM agents write near `CLEAR` by default, and every band but the top one points below that, so a cue that is read at all pulls `|graded|` down. That shrinks `|r|`, hence `Q* = E[r]`, hence `|q_gap|`: negative feedback on the cue's own scale, which lengthens settling (the reason `A-00` sets the horizon) and moves every graded null. The hedger ceiling may put band 3 out of reach; it stays as a marker on the mechanism's scale. A cue that moves `|graded|` not at all means the mechanism is inert, not null.
+
+**Scope.** Both gate stages of `respond()` and both steps of `reflect()` carry the cue; the raw value is logged per turn (`gate.cue`). Cued reflections are stored as memories, so a tentatively worded insight can resurface later; that path pushes the same way as the main effect. The classifier-audit corpus is drafted across all four bands, because an uncued corpus is no longer the population the classifier meets in a run.
+
+**Cost.** The cue hardens the anchor at high bands, so the flip rate becomes conviction-dependent. It is also the one channel `analysis/benchmark/benchmark_sft.py` cannot import: it lives in the model's response to a sentence. Of the benchmark's reward variants, `graded-agent` holds per-agent magnitude constant and is the right comparison; the three graded nulls fitted on Bracket A inherit the cue's *level* through the marginal reward but draw it iid, so they cannot produce the low-Q trap (band 0 → hedged text → small `|r|` → band 0). A `graded-conviction` variant keyed on `(dyad cell × cue band)` would. **It is planned, not implemented** (`final_schedule.md` § Bracket B).
 
 ### Interaction loop (one asymmetric interaction)
 
 ```
-1. Draw expresser     uniform random from agents with ≥1 neighbour
-2. Draw responder     select_responder() from expresser's adjacency, weighted by
-                      the expresser's own expected reward per neighbour (β_sel)
-                      β_sel=0 → uniform; β_sel>0 → neighbours with higher past
-                      reward to the expresser preferred
-3. Draw softmax stance softmax(β) draw over Q-values → softmax stance (+1 or −1)
-                      β=0 → 50/50; β→∞ → deterministic argmax
-4. Exchange           1 exchange: expresser speaks, responder reacts, both turns
-                                   pass through the expression gate (respond()), which
-                                   generates from the soft persona-stance-bridge prompt
-                                   and rejects/regenerates any draft that flips the
-                                   speaker's softmax stance (see SFT expression gate).
-                                   On the first meeting the expresser responds to the
-                                   moderator's topic; on repeat meetings it responds to
-                                   the partner's last message, continuing the dialogue.
-                                   The topic is always in the stance hint.
-5. Reward             r = graded(a's expression) · graded(b's reaction) ∈ [−1, +1]
-                      product of two topic-anchored graded stances, both already
-                      read off the gate records (no extra LLM call)
-6. Q-update           Q(gate_final_expressed_a) ← (1−α)·Q + α·r  [expresser only]
-7. Reward record      record_reward(reward_a), appends r to the expresser's
-                      rolling history on this edge (window REWARD_WINDOW_M),
-                      feeding future select_responder draws
-8. Edge update        update_edge()  [GRAPH_DYNAMIC only]
-                      signal = mean(history) drives strength update
-   (steps 6-8 fire only on a measured-reward round, a clear stance AND a
-    scorable reward; all three frozen on abstention (ambiguous) or reward None)
+1. Draw expresser     uniform over agents with ≥ 1 neighbour
+2. Draw responder     select_responder(): weight exp(β_sel · mean reward the expresser got
+                      from that neighbour); β_sel = 0 is uniform
+3. Softmax stance     p(+1) = σ(β · q_gap); β = inf is the deterministic argmax
+                      (a tie stays a fair coin); plus the conviction cue
+4. Exchange           expresser speaks, responder reacts, both through the gate.
+                      First meeting: the expresser answers the moderator's opener,
+                      drawn per exchange between two wordings; repeat meeting: the
+                      partner's last message
+5. Reward             r = graded(expression) · graded(reaction) ∈ [−1, 1], read off
+                      the gate records
+6. Q-update           Q(final_expressed) ← (1−α)·Q + α·r   [expresser only]
+7. Reward record      record_reward(): r into the edge's rolling window (REWARD_WINDOW_M)
+8. Edge update        update_edge()  [GRAPH_DYNAMIC]
+9. Rewire             rewire_after_drop()  [GRAPH_DYNAMIC, REWIRE_RULE != "off"]
+   Steps 6-9 run only on a measured-reward round: a non-zero expressed stance
+   and a non-None reward. Otherwise all of them freeze.
 ```
 
 ### Two reward signals
 
 | Signal | Source | Used for |
 |---|---|---|
-| `reward_a` | `graded(a's expression) · graded(b's reaction)` (`reward_from_expressions`), the product of a's own first turn's graded stance and b's last turn's graded stance | Q-value TD update (expresser only); recorded via `record_reward()` into edge-history (both modes), feeding `select_responder` and, when `GRAPH_DYNAMIC = True`, the edge-strength update. All three consequences fire only on a measured-reward round and are frozen together on a no-signal round, an abstention (ambiguous expression) or a `None` reward (b's reaction UNRELATED/unparseable) |
-| `reward_b` | `graded(b's expression) · graded(a's reaction)`, the mirror signal | Available for symmetric edge/strength extension; not used in any active update path |
+| `reward_a` | graded(a's first turn) · graded(b's last turn) | Q-update, reward record, and (dynamic graph) edge valuation, all on measured-reward rounds only |
+| `reward_b` | the mirror | Unused; `None` at one turn each, since a's turn precedes b's |
 
-Each graded factor is an independent, context-free classification of a *single* turn (no persona, no full transcript, no pairing of the two texts), so expression and reward remain as causally independent as possible — and, because both factors come from the same topic-anchored classifier, the reward is **symmetric by construction**: two agents on the same side reinforce, opposite sides penalise, regardless of *which* side, with no relational judgement that could read mutual rejection asymmetrically (the reason the earlier relational `classify_reward()` was replaced; see [Where the extension lives](#where-the-extension-lives-when-the-scalars-look-canonical)). `run_discussion()` computes both signals; `reward_b` is available for a future symmetric extension. A signal is `None` when the reaction is `UNRELATED`/unparseable (its graded factor is `None`); when `reward_a` is `None` the main loops freeze the whole round's reward consequences (no Q-update, no reward record, no edge dynamics), the same freeze an abstention triggers, rather than treating the missing reward as a genuine zero.
+Each factor is an independent, context-free grading of a single turn, so expression and reward stay causally separate, and both come from one absolute classifier, so the reward is **symmetric by construction**: same side reinforces, opposite sides penalise, whichever side. (An earlier relational reward judge read mutual rejection as disagreement and tilted consensus toward one pole.) A `None` reaction (UNRELATED or unparseable) freezes the round exactly as an abstention does.
 
 ### How a reward moves the Q-values
 
-The update `Q ← (1−α)·Q + α·r` (only the expressed stance's Q; the other is untouched) is an exponential moving average, so **`Q(stance)` converges to the mean reward that stance has earned**. Two consequences worth internalising:
+`Q ← (1−α)·Q + α·r` is an exponential moving average, so **`Q(stance)` converges to the mean reward that stance earned**; a sustained `r` has fixed point `Q = r`.
 
-- **Reward sign sets the direction.** `r > 0` pulls `Q(stance)` up (expressing it was socially rewarded → more valued); `r < 0` pulls it down. The fixed point of a sustained reward `r` is exactly `Q = r`.
-- **`r = 0` is not a no-op; it decays.** An **ambivalent** reaction (graded stance `AMBIVALENT → 0.0`, so `r = graded(expresser) · 0.0 = 0.0`) is a *genuine, informative reward signal*, not an absence of one. Applying it does `Q ← (1−α)·Q`, a geometric shrink toward the neutral fixed point (≈10% per hit at `α = 0.1`), on the expressed stance only. Because this pulls the dominant Q toward 0, it shrinks `|q_gap|`, which makes the next softmax draw `p(+1) = σ(β·q_gap)` more random, i.e. **mixed feedback erodes conviction and moderates expression**. This is exactly the graded-reward mechanism the binary ±1 model cannot represent, and the moderation-through-mixed-feedback effect Sárközi et al. (2022) found empirically influential (see [Theoretical alignment](#theoretical-alignment)).
+- The sign of `r` sets the direction.
+- **`r = 0` is not a no-op.** An ambivalent reaction applies `Q ← (1−α)·Q`, about a 10 % shrink per hit at `α = 0.1`, which narrows `|q_gap|` and randomises the next draw: mixed feedback erodes conviction. The binary model cannot represent this, and Sarközi et al. (2022) found ambivalent feedback the most influential.
 
-This is precisely why an ambivalent reward (`0.0`, *applied*, Q decays) must stay distinct from the *skip* cases (abstention, or `None` from a parse failure / `UNRELATED` reaction, Q untouched). Fabricating a `0.0` on a round where no reward was actually observed would inject this real moderating force where none was earned; conversely, treating a genuine ambivalent reaction as "no signal" would discard a load-bearing part of the graded-reward extension. The `AMBIVALENT` (graded `0.0`) vs `UNRELATED`/parse-fail (graded `None`) split in `classify_expression_graded()` — the classifier that produces the reaction factor — exists to keep the two apart.
+Hence the split the classifier keeps: `BALANCED`/`NEITHER` → `0.0` (applied) versus `UNRELATED`/parse failure → `None` (skipped). Fabricating a `0.0` where nothing was measured would inject a moderating force; skipping a genuine `0.0` would discard the graded extension.
 
 ---
 
 ## Agent primitives
 
-### `respond(message, speaker, softmax_stance) -> (str, dict)`
+### `respond(message, speaker, softmax_stance, cue=None) -> (str, dict)`
 
-Retrieves up to `MAX_MEMORIES_RETRIEVE` relevant memories, anchors to an SFT stance (`softmax_stance`: +1 or −1, the softmax draw for this interaction), and generates a position-taking reply **through the [expression gate](#sft-expression-gate)**. Retrieval is biased toward memories tagged with this same `softmax_stance` (see [Memory system](#memory-system)), so the memories injected into the prompt already skew toward the agent's own past stance-congruent experience. The generation prompt injects the cached persona-stance bridge (molded per-stance by `_mold_stance()`, cached by `_derive_stance_bridges()`) for the anchored stance, never `self.persona` directly, and stays deliberately **soft** (no hard anti-drift instruction). Enforcement is output-side: each draft is graded by `classify_expression_graded()`, and a draft whose stance *sign* *flips* the softmax stance **or is `None`** (UNRELATED/unparseable) is rejected and regenerated (on-stance or genuine-ambivalent drafts pass). Returns `(reply, gate_record)`, the accepted reply plus the full rejection-sampling history (every draft text, its expressed stance sign and graded value, its cascade stage). The interaction is stored as a memory tagged with the gate's `final_expressed` sign. The caller indexes the Q-update on `final_expressed` and **skips it when that is `0`/ambiguous** (a strategic abstention); post-hoc analysis derives the persona-field telemetry (first-attempt fidelity, retry counts). With `SFT_GATE_ENABLED = False` the gate degrades to a single ungated draft (Step A soft anchoring only), returned in the same shape.
+Retrieves up to `MAX_MEMORIES_RETRIEVE` memories, biased toward the anchored stance (see [Memory system](#memory-system)), and generates a reply **through the [expression gate](#sft-expression-gate)**. Returns the accepted reply and its gate record, and stores the exchange as a memory tagged with `final_expressed`. With `SFT_GATE_ENABLED = False` it makes one ungated draft in the same return shape.
 
-**Do not soften the position-taking instruction.** A legible stance is required for `classify_expression_graded()` to read the expressed stance (and thus the reward) reliably.
+**Do not soften the position-taking instruction**: the classifier needs a legible stance.
 
 ### `classify_expression_graded(text) -> float | None`
 
-The single classifier in the system. Grades where a piece of generated text stands on `TOPIC_TEXT`: a value in [−1, 1] (+ favors, − opposes), `0.0` (genuine ambivalent), or `None` (UNRELATED to the topic, or unparseable after one retry). Minimal prompt, no persona, no memory, no transcript context, so generation (`respond()`) and evaluation stay causally separate. It is **absolute, not relational** — it judges one text against the topic, never one text against another — which is what makes the reward symmetric: mutual opposition and mutual favor are the *identical* classification problem (an earlier relational reward classifier systematically misread mutual rejection as disagreement, tilting consensus toward the "favor" pole; see [Where the extension lives](#where-the-extension-lives-when-the-scalars-look-canonical)).
+The single classifier. A **forced choice between two named answers**: `TOPIC_TEXT` and `TOPIC_TEXT_OPPOSITE`, with **no question shown**, since both are self-contained propositions and a question would name one pole first in every call. Minimal prompt: no persona, memory or transcript. **Absolute, not relational**: it judges one text against the two answers, never one text against another, which is what makes the reward symmetric.
 
-The seven ordinal labels are anchored to a **concession-counting rubric** — CLEAR = grants the other side nothing, PREDOMINANT = holds the position but grants at least one point, SLIGHT = supports/opposes only under explicit conditions, or concedes so much the lean is barely discernible — and the classifier enumerates the text's concessions *before* choosing a label. (SLIGHT anchors sharpened 2026-07-19: the earlier wording "hedged or conditional" was the only boundary not stated in concession/condition terms, and ±0.3 was chosen ≤4 times per 1000 turns in the first three Phase 2 runs — see `analysis/logs/Phase2/Phase2_initial_findings.md`, F2.) Unanchored clear/predominant/slight scales let an LLM judge saturate at the endpoints (in the pre-rubric run `run_1783771774`, 191 of 223 rewards landed at exactly ±1.0), which collapses the graded reward this design exists to provide. Note that part of that bimodality is in the data, not the judge: gate-enforced turns are unqualified position statements, so they legitimately earn ±1.0; the rubric only ensures that turns *with* concessions can reach the intermediate labels. The label→value map (`_GRADED_STANCE_LABELS`): ±1.0 / ±0.6 / ±0.3 / 0.0, plus `UNRELATED → None`. Backed by `_invoke_labeled()`: the model picks one label under a JSON-schema constraint rather than emitting free text.
+Favor/oppose vocabulary is out of the rubric, so the only presentation asymmetry left is which answer comes first. **That order is drawn per call** (`_SLOT_RNG`) and the score re-anchored to `TOPIC_TEXT`, so the rater's position bias is zero-mean in `Q* = E[r]` instead of loading onto the +1 stance. The drawn slot is logged per attempt (`topic_first`), which makes the bias estimable from a run's own events (`metrics.order_bias`).
+
+The reply is `{reasoning, direction, strength}` under Ollama's JSON-schema `format`:
+
+- `direction`: `A`, `B`, `BALANCED` (merit in both, settles on neither), `NEITHER` (rejects both, or holds a third position), `UNRELATED` (not the speaker answering: off-topic, or about the prompt, persona or model).
+- `strength` (A/B only), a **concession-counting rubric**: `CLEAR` grants the other answer nothing, `PREDOMINANT` at least one point, `SLIGHT` supports its answer only conditionally or barely. `reasoning` comes first and lists the concessions, so `strength` cannot be emitted before they are written out, which keeps the judge from saturating at the endpoints. Gate-enforced turns are unqualified statements and legitimately earn ±1; the rubric makes the intermediate levels reachable for turns that do concede.
+
+`stance_score()` maps this to ±1 / ±2⁄3 / ±1⁄3 (evenly spaced, since the ladder is only ordinal), `0.0` for `BALANCED`/`NEITHER`, `None` for `UNRELATED`. `_invoke_graded()` retries a malformed reply once (including A/B without a strength), so in a run `None` means `UNRELATED` or two failed attempts. `BALANCED` and `NEITHER` stay apart only so the [audit](../analysis/classifier/README.md) can tell them apart.
 
 ### `classify_expression(text) -> int | None`
 
-The **sign** of `classify_expression_graded()`: +1/−1/0, or `None`. A thin wrapper for callers that need only the ternary stance — `reflect()` tags each insight memory with it (collapsing `None → 0`). The gate uses the sign directly for arbitration (a draft passes iff its sign matches the softmax draw or is a genuine `0`; a *flip* is rejected, a `None` is retried), while the graded magnitude is carried through untouched to feed the reward.
+The sign of the above; `reflect()` tags insights with it.
 
 ### `reward_from_expressions(graded_expr, graded_resp) -> float | None`
 
-The social reward, computed not by an LLM but as the product `r = graded_expr · graded_resp ∈ [−1, 1]` — the `o_i · o_j` form. Both factors are `classify_expression_graded()` outputs already read off the gate records (the expresser's first turn and the partner's last reaction), so no LLM call happens here. Two same-side stances reinforce (positive `r`), opposite sides penalise (negative), and each factor's magnitude scales the signal by how firmly that turn committed. Returns `None` when the *reaction* is `UNRELATED`/unparseable (`graded_resp is None`), so the caller skips the TD update; a genuine ambivalent reaction (`0.0`) yields `r = 0.0`, a real neutral signal that still decays Q (in the TD rule `Q ← (1−α)·Q + α·r`, `r = 0` is not "no signal" — see [How a reward moves the Q-values](#how-a-reward-moves-the-q-values)). The expresser's own factor is never `None` (a gated turn always resolves to a sign; the ungated arm collapses `None → 0.0`). When `reward_a` is `None`, the main loops (`main_pairwise.py`, `main_network.py`) freeze the whole round's reward consequences (Q-update, reward record, and edge dynamics) exactly as for an abstention; the difference (measurement failure vs. agent opt-out) survives only in the log message.
+`r = graded_expr · graded_resp`, the `o_i · o_j` form with graded factors; `None` when either factor is `None`.
 
-**Why both magnitudes multiply (design commitment, 2026-07-19).** The product makes social reward learning a function of *both* sides' expressed determination: the expresser's own graded commitment scales every reward it receives, so a habitual hedger's Q converges to at most its own mean |graded| (the "hedger ceiling", diagnostic F3 in `analysis/logs/Phase2/`). This is retained deliberately rather than treated as an artifact, on four grounds. (1) It is the literal continuous generalisation of Banisch & Olbrich's `r = o_i · o_j`, where `o_i` is already the agent's *own expressed* opinion — the binary encoding merely hides the own-side factor and its consequences. (2) Product-form updates are the canonical coactivation (Hebbian) form of associative attitude strengthening used by connectionist attitude models (van Overwalle & Siebler 2005; Monroe & Read 2008). (3) The own-side factor tracks self-perception and commitment effects: attitudes consolidate in proportion to how unambiguously they were publicly expressed (Bem 1972; Kiesler 1971; repeated-expression extremity, Downing, Judd & Brauer 1992; saying-is-believing, Higgins & Rholes 1978). (4) The partner-side factor tracks reinforcement magnitude in the verbal operant-conditioning literature — emphatic social approval is a larger reinforcer than tepid assent (Verplanck 1955; Hildum & Brown 1956; Insko 1965). The rival "pure social signal" reading — reward as the other's evaluation only, `r = sign(own) · graded(reaction)` — is a different micro-foundation, kept as a planned ablation (`analysis/logs/Phase2/Phase2_initial_findings.md`, next steps). References recalled from memory; verify before citing in the thesis text.
+**Why both magnitudes multiply.** The expresser's own commitment scales every reward it receives, so a habitual hedger's Q converges to at most its own α-weighted mean `|graded|` (the **hedger ceiling**; measured in [`../analysis/design_analysis.ipynb`](../analysis/design_analysis.ipynb) § 4). This is kept on purpose, on four grounds: (1) it is the literal continuous generalisation of B&O's `r = o_i · o_j`, where `o_i` is already the agent's own expressed opinion; (2) product updates are the coactivation (Hebbian) form of connectionist attitude models (van Overwalle & Siebler 2005; Monroe & Read 2008); (3) attitudes consolidate with how unambiguously they were expressed (Bem 1972; Kiesler 1971; Downing, Judd & Brauer 1992; Higgins & Rholes 1978); (4) emphatic approval is a larger reinforcer than tepid assent (Verplanck 1955; Hildum & Brown 1956; Insko 1965). The rival reading, `r = sign(own) · graded(reaction)`, is a planned ablation. *References recalled from memory; verify before citing.*
 
-### `reflect(argmax_stance)`
+### `reflect(argmax_stance, cue=None)`
 
-Two-step: generate 2 reflection questions from the most recent `MAX_MEMORIES_SEED` memories → synthesise 1 insight per question. Both steps are anchored to the caller-supplied `argmax_stance` (the agent's deterministic Q-value argmax, not a per-interaction softmax draw) via the same persona-molded `_stance_bridges` sentence `respond()` uses, instead of the raw persona. Retrieval for each question is stance-biased toward `argmax_stance` (see "Stance congruence" under [Memory system](#memory-system)). Stores insights as high-importance `"reflection"` memories, each tagged via `classify_expression()` with the stance the insight actually expresses, so later stance-biased retrieval in `respond()` can surface it. Triggered every `REFLECT_EVERY` rounds. Reflection is **not gated**: insights never enter a social interaction, so the [expression gate](#sft-expression-gate)'s contract does not apply, and gating them would suppress precisely the persona-driven consolidation the memory system is meant to exhibit.
+Two steps (Park et al. 2023): two questions from the `MAX_MEMORIES_SEED` most recent memories, then one insight per question from stance-biased retrieval. Both steps are anchored to the argmax stance and carry the cue. Insights are stored as high-importance `"reflection"` memories tagged with their classified stance. Runs every `REFLECT_EVERY` rounds when `MEMORY_ENABLED`. **Not gated**: insights never enter an interaction, and gating would suppress the persona-driven consolidation memory exists to exhibit.
+
+### `draft(message, speaker, stance, cue=None) -> str`
+
+Gate stage 1 stopped before classification, with no memory written: the population the classifier meets in a run. Used only by the classifier audit's corpus.
 
 ---
 
 ## SFT expression gate
 
-The gate is how the simulation keeps its learning loop canonically SFT while still building agents out of rich, opinionated personas. It sits inside `respond()` (`agents/agent.py`, `_sft_gate()`).
+`_sft_gate()` in `agents/agent.py` keeps the learning loop canonical while agents keep opinionated personas.
 
 ### The intuition
 
-Canonical SFT says an agent draws a stance and expresses *that* stance; the social reward it earns then updates the Q-value of the stance it drew. In an LLM agent, "expressing the drawn stance" is not free: the persona is a strong prior, and when the softmax draw lands on the stance the persona dislikes, the model frequently writes the *opposite* stance anyway. Under the earlier soft-anchoring baseline (Step A) this happened routinely: on a β=0 coin-flip harvest, drafts anchored to one stance kept it only ~43% of the time versus ~84% for the other. Two problems follow: the reward then scores an utterance the Q-machinery never selected, and the persona-dispreferred stance is rarely *explored*, so its Q-value starves for feedback. That is the **persona field**, a real, measurable pull that a plain implementation lets silently corrupt the learning signal.
+Canonical SFT assumes an agent expresses the stance it drew. An LLM with a persona often writes the opposite when the draw lands on the stance the persona dislikes; the reward would then score an utterance the Q-machinery never selected, and the dispreferred stance would starve for feedback. The gate enforces the draw **output-side**: the prompt stays soft, so the *first* draft still samples the persona's unconstrained pull (the **persona field**), but a draft enters the conversation only if its sign does not contradict the draw. The pull moves from silently corrupting the update to being logged.
 
-The gate resolves this **output-side** rather than by hardening the prompt. The generation prompt stays exactly as soft as before, so the *first* draft of every turn still samples the unconstrained, persona-influenced distribution, which is what keeps the persona field measurable. But a draft only enters the conversation if `classify_expression()` confirms it does not contradict the drawn stance; a draft that flips the stance is rejected and regenerated. The stance that enters each interaction is therefore the drawn one (or an ambiguous utterance), never its opposite, so the reward always scores the stance the Q-machinery selected, and both stances get explored at the rate β prescribes. The persona field does not disappear; it **moves** from silently corrupting the Q-update to being logged, as how many drafts each turn needed and what the rejected drafts said.
+**Abstentions pass.** A `BALANCED` or `NEITHER` draft is not a counter-stance and carries no evidence of persona override; rejecting it would spend retries on legibility noise and contaminate the retry count. It enters the conversation as a **strategic abstention**: the speaker puts no side up for evaluation, and the round's Q-update, reward record and edge dynamics all freeze.
 
-Why *ambiguous* drafts pass rather than retry: an ambiguous utterance is not a counter-stance expression, so it carries no evidence that the persona overrode the draw. Rejecting it would spend retries on legibility noise and contaminate the retry count, which is the persona-pressure measure. Instead, an ambiguous draft enters the conversation but **freezes the whole round's reward consequences**. A vague statement is read as a *strategic abstention*: the agent declined to put a clear stance up for social evaluation, dodging reward and punishment for that round. Concretely, on an abstention the expresser gets **no Q-update, no reward recorded to the edge history (which feeds `select_responder`), and no edge-strength update**; its opinion and its relationships both stay put. (This is distinct from an *ambivalent reward*, which is a genuine neutral signal that still updates Q; see the terminology note below.) An unreadable reward triggers the *same* full freeze as an abstention: when the reaction's graded stance is `None` (parse failure or `UNRELATED`), `reward_from_expressions()` returns `None` and the round's Q-update, reward record, and edge dynamics are all skipped. So the reward channel moves only on a **measured-reward round**, a clear stance *and* a scorable reaction, and the two no-signal cases (agent opt-out vs. measurement failure) are distinguished only in the console log, not in their effect.
+### An agent abstaining vs. a model refusing
+
+What must not pass is the **model** stepping out of the discussion: writing about the prompt, the persona or itself instead of taking a turn. Letting that through would put meta-commentary into the transcript and apply `r = 0.0` on whichever pole the model balks at, a stance-dependent decay and exactly the asymmetry positive pole anchoring (`_stance_pole()`) removes.
+
+**The line is drawn in the rubric, not in the gate.** `graded_stance_prompt()` sends an abstention to `NEITHER`/`BALANCED` (`0.0`, passes) and a frame break to `UNRELATED` (`None`, rejected). The gate sees a number, not text, and prose pattern-matching misfires on emphatic in-character writing ("I cannot support a system that leaves my children with radioactive waste" is an on-stance −1 turn). Stage 2 of the cascade drops the persona, which is the right rescue for a persona-conflict refusal. `_gate_verdict()` records `"unrelated"` apart from `"unparseable"`, so the refusal rate is countable per anchored stance (`metrics.load_gate`'s `n_unrelated`, `persona_field`'s `unrelated`). A rate that differs between anchors is the model's reluctance, not persona pressure (`n_flip`).
 
 ### The mechanism
 
-Rejection sampling in three cascade stages, all arbitrated by `classify_expression()` against the softmax stance (a draft **passes** iff its expressed stance equals the draw *or* is a genuine `0`/ambiguous; a *flip* to the opposite stance and an *unparseable* draft (`None`) are both rejected and retried, with `fail_reason` `"flip"` / `"unparseable"` recorded):
+Rejection sampling in three cascade stages. A draft **passes** iff its sign equals the draw or is `0`; a flip, an `UNRELATED` draft and an unparseable reply are retried, with `fail_reason` recorded.
 
-1. **main**, up to `SFT_GATE_MAX_ATTEMPTS` drafts from the soft persona-stance-bridge prompt (`_generate_reply()`). Retries re-sample the *same* prompt (no escalation), so the number of rejected drafts is a clean i.i.d. measure of persona-field pressure at that point.
-2. **fallback**, up to `SFT_GATE_MAX_ATTEMPTS` drafts from a context-free variant of the same prompt (`_fallback_reply()`: identical wording minus the memory block and the persona-derived stance bridge; no escalation), same pass criterion.
-3. **final**, a fixed on-stance template (`_final_fallback_reply()`), deterministic, no LLM call. Guarantees the cascade terminates in a text that cannot contradict the draw. (It is tagged on-stance without re-classifying, so if `TOPIC_TEXT` changes, verify once that `classify_expression()` reads both templates as intended.)
+1. **main**: up to `SFT_GATE_MAX_ATTEMPTS` drafts from the soft prompt. Retries resample the same prompt, so rejected drafts are an i.i.d. measure of persona pressure.
+2. **fallback**: up to `SFT_GATE_MAX_ATTEMPTS` drafts from the same prompt without memories or anything persona-derived (cue kept), which makes this stage identical under both bridge settings.
+3. **final**: a fixed template, `My position: <pole>.`, tagged on-stance without classification. Sound because it states one of the classifier's two answers verbatim; re-verify once if `TOPICS` changes.
 
-Each stage bails early if sampling collapses (a draft repeats the previous verbatim, e.g. at temperature 0); further identical retries could not pass. Memory retrieval runs once per gate call, not per attempt.
+A stage stops early if a draft repeats verbatim; memories are retrieved once per turn. Since the cascade emits only on-stance or abstaining text, a performed update always indexes the draw under the gate; in the ungated ablation (`SFT_GATE_ENABLED = False`) the same code path indexes the classified sign. `SFT_GATE_MAX_ATTEMPTS` defaults to 5.
 
-Because the cascade can only ever emit an on-stance or ambiguous text, the downstream Q-update is simple: the main loops index it on `gate_final_expressed` and act only on a **measured-reward round**, a clear stance (`gate_final_expressed != 0`) *and* a scorable reward (`reward_a is not None`). That same condition gates all three reward consequences together (Q-update, edge reward record, edge-strength dynamics), so a no-signal round, abstention or unparseable reward, leaves opinion *and* relationships untouched. Under the gate a performed update always indexes the softmax draw (the only non-zero stance the cascade admits); in the ungated ablation arm the same line indexes the classified expressed stance; one code path serves both arms.
-
-**Terminology.** Both neutral cases come from the same `classify_expression_graded()` label `AMBIVALENT → 0.0`, but they behave differently depending on *whose* turn it grades. *Ambiguous* refers to the **expresser's own** turn: a draft with no discernible stance (graded `0.0`, sign `0`), treated as an abstention that skips learning. *Ambivalent* refers to the **reaction** turn: a genuine mixed/neutral reaction (graded `0.0`) that makes `r = graded(expresser) · 0.0 = 0.0` and *does* update Q toward the neutral fixed point. So an ambiguous expression suppresses the update (sign `0` = abstain); an ambivalent reaction performs one with `r = 0.0`.
-
-### Configurability
-
-`SFT_GATE_ENABLED` (`config.py`) toggles the gate. `True` (default) is the thesis's main condition. `False` reproduces the pre-gate Step A soft-anchoring behaviour: a single ungated draft, no retries, no cascade, wrapped in a one-attempt gate record so both arms share the exact same `(reply, gate_record)` interface and the exact same unified Q-update rule. This makes the gated-vs-ungated contrast a clean A/B: does output-side enforcement change the macro-dynamics? `SFT_GATE_MAX_ATTEMPTS` (default 5) is the per-stage attempt budget.
-
-**Cost.** Each attempt is one generation + one classification call. With the measured first-attempt fidelities as pass probabilities, expect ≈1.2 attempts on the persona-preferred stance and ≈2.2 on the dispreferred one, roughly **1.7× LLM calls per `respond()`** at a 50/50 draw marginal, concentrated on persona-dispreferred draws. The context-free fallback fires at ≪10% and the fixed template at a negligible rate. (These figures were measured under the earlier immigration topic and the earlier prompt wording — before the stance was moved after the partner's message (recency anchoring) and "express your position" became "express the position stated above" — so re-harvest under the current `TOPIC_TEXT` and prompts before relying on them; see `test_schedule.md`.)
+**Cost.** Each attempt is one generation plus one classification, so turn cost scales with 1 / P(first draft on-stance). Realised multipliers are readable from `n_attempts`, `fallback_used` and `final_fallback_used` in `events.jsonl`.
 
 ### The gate record (persona-field telemetry)
 
-Every turn logged to `events.jsonl` carries a `gate` record, the unit that replaces the retired reward-audit's fidelity mode as the persona-field readout:
+Every turn in `events.jsonl` carries one:
 
 ```json
 {
-  "n_attempts": 3,
+  "n_attempts": 4,
   "passed": true,
   "fallback_used": false,
   "final_fallback_used": false,
   "first_attempt_expressed": -1,
   "final_expressed": 0,
+  "final_expressed_graded": 0.0,
+  "cue": 0.21,
   "attempts": [
-    {"stage": "main", "text": "...", "expressed": -1, "fail_reason": "flip"},
-    {"stage": "main", "text": "...", "expressed": null, "fail_reason": "unparseable"},
-    {"stage": "main", "text": "...", "expressed": 0}
+    {"stage": "main", "text": "...", "topic_first": true,  "expressed": -1,   "expressed_graded": -1.0, "fail_reason": "flip"},
+    {"stage": "main", "text": "...", "topic_first": false, "expressed": null, "expressed_graded": null, "fail_reason": "unparseable"},
+    {"stage": "main", "text": "...", "topic_first": true,  "expressed": null, "expressed_graded": null, "fail_reason": "unrelated"},
+    {"stage": "main", "text": "...", "topic_first": false, "expressed": 0,    "expressed_graded": 0.0}
   ]
 }
 ```
 
-Here the softmax anchor was `+1`: draft 1 flipped (rejected), draft 2 was unparseable (rejected, `expressed: null`), draft 3 was a genuine ambiguous and passed. `final_expressed` is never `null`: the gate never accepts an unparseable draft, and the fixed template (stage 3) is on-stance by construction.
+With anchor `+1`: draft 1 flipped, draft 2 was unparseable, draft 3 was a frame break, and draft 4 abstained and passed. `final_expressed` is never `null`. `topic_first` is the classifier slot drawn (`null` on the template); because it is drawn independently of the anchor, the two are crossed in the log and the rater's position bias is estimable.
 
-**Fidelity is now a unit of analysis, not a simulation variable.** `first_attempt_expressed` versus the turn's softmax anchor is exactly the old fidelity estimand, the persona field's pull on the *unconstrained* draft distribution, but graded by retry counts, cascade-stage rates, and the draft texts the old scalar lacked. `analyze_gate.py` mines all of this from `events.jsonl` post-hoc (zero LLM cost): per-anchor first-attempt fidelity/flip/ambiguity/**unparseable** (the four mutually-exclusive rates sum to 1; the unparseable rate is a classifier-reliability signal, distinct from persona-driven ambiguity), mean drafts per turn, fallback and template rates, a two-proportion test on the +1-vs-−1 fidelity asymmetry, and (with `--drift`) semantic drift across a turn's successive drafts.
+First-attempt fidelity (`first_attempt_expressed` against the anchor), flip / ambiguous / unrelated / unparseable rates, retry counts, fallback and template rates, and drift across a turn's drafts are all recoverable post-hoc at no LLM cost: `analysis/metrics.load_gate` and `persona_field()` (see [`../analysis/README.md`](../analysis/README.md) § Persona-field analysis).
 
 ---
 
 ## Memory system
 
-Each agent has an isolated [ChromaDB](https://www.trychroma.com) collection. Retrieval ranks by composite score:
+One isolated [ChromaDB](https://www.trychroma.com) collection per agent. Retrieval scores the whole collection:
 
 ```
 score = WEIGHT_RECENCY·recency + WEIGHT_IMPORTANCE·importance
       + WEIGHT_RELEVANCE·relevance + WEIGHT_STANCE_CONGRUENCE·congruence
 ```
 
-Defaults (`config.py`): `0.25 / 0.25 / 0.3 / 0.2`, must sum to 1.0.
+Weights `0.25` each (`config.py`). Recency decays exponentially; importance is LLM-rated 1–10; relevance is inverted cosine distance. **Stance congruence**: each memory is tagged with the stance it expressed (`+1`, `−1`, or `0` when ambiguous); a retrieval anchored to a stance (`respond()`: the softmax draw; `reflect()`: the argmax) scores congruent memories 1, opposing 0, neutral 0.5. That implements motivated recall without hard-filtering opposing memories; `WEIGHT_STANCE_CONGRUENCE` sets its strength, and `0` restores stance-agnostic retrieval (rebalance the other weights).
 
-- **Recency**: exponential decay over time
-- **Importance**: LLM-rated significance (1-10), normalised to [0, 1]
-- **Relevance**: cosine similarity to the current query embedding
-- **Stance congruence**: whether the memory's stance tag matches the retrieving agent's current query stance. Every memory is tagged at write time with the stance it was formed under (+1, −1, or 0 = neutral/unknown): `respond()` tags the interaction it stores with the stance actually expressed in the reply, classified via `classify_expression()` (not the `softmax_stance` used to anchor the prompt); `reflect()` tags each insight the same way; an ambiguous classification leaves the memory untagged (0). At retrieval time, `respond()` passes its current `softmax_stance` and `reflect()` passes its caller-supplied `argmax_stance` as the query stance, so congruent memories score 1.0, opposing memories score 0.0, and neutral-tagged memories (or any retrieval call that passes no query stance) score a constant 0.5, neither boosted nor penalised. This implements a motivated-recall / biased-assimilation effect: agents preferentially surface their own past stance-congruent experience when forming a reply or reflecting, without ever being hard-filtered off opposing memories entirely (`WEIGHT_STANCE_CONGRUENCE` sets how strong the bias is, not whether opposing memories can appear at all).
-
-`WEIGHT_STANCE_CONGRUENCE = 0` degenerates to the original 3-signal, stance-agnostic ranking (rebalance the other three weights back to sum to 1.0 if you do this). Higher values push opposing-stance memories out of the top-`MAX_MEMORIES_RETRIEVE` window even when they are relevant/recent, strengthening entrenchment; this is a deliberate experimental knob, not a fixed constant; see [Configuration](#configuration-configpy).
+`MEMORY_ENABLED = False` (Stage 4's ablation) returns no memories and skips reflection; writing continues.
 
 ---
 
 ## Persona pool
 
-Personas are sampled from `data/gss_personas.json`, derived from `data/GSS2024.dta` (the 2024 GSS Release 3 Stata extract, 3,986 respondents). The export pipeline (`notebooks/script.ipynb`) selects an explicit **allowlist** of persona-defining variables (`INCLUDE_VARIABLES`) from the full GSS variable set and maps each to a human-readable label, rather than filtering a free-text question column as the German pipeline did; GSS extracts are wide-format with one column per variable code (lowercase in the `.dta` file).
+`data/gss_personas.json` comes from `data/GSS2024.dta` (2024 GSS Release 3, 3,986 respondents; both git-ignored) via `notebooks/data_processing.ipynb`. The export keeps an **allowlist** of 91 variables (`INCLUDE_VARIABLES`) and drops the rest of the ~1,000-variable release. `agents/personas.py` then has the LLM invent a first name and a 2–3 sentence second-person persona covering life situation and personality, without political opinions.
 
-> **Status:** live. `data/GSS2024.dta` is in the repo (git-ignored, it's raw third-party survey data) and `notebooks/script.ipynb` has been run against it, producing `data/gss_personas.json` (also git-ignored, since it's a regenerable derived artifact).
-
-### Survey indicator filtering
-
-The filtering logic is an **allowlist**, not a blocklist: `INCLUDE_VARIABLES` names the ~90 variables to keep, and everything else in the GSS's ~1,000-variable release is dropped by omission. The line between "in" and "out" is drawn at *what the respondent believes policy should be* versus *who the respondent is*: explicit attitude/opinion items are excluded regardless of topic, while demographic/background facts are kept even when topically adjacent to immigration (citizenship, birthplace, ancestry, migration history; see "Excluded field categories" below for the reasoning).
-
-Two data-quality corrections were needed once the real extract was available:
-
-- **`INCOME`/`RINCOME` → `CONINC`/`CONRINC`.** GSS's classic income variables are frozen historical brackets kept for trend consistency since the 1970s, top-coded at `"$25,000 or more"`; in 2024 dollars, nearly every household clears that bracket, so the field would carry almost no information. `CONINC`/`CONRINC` are GSS's own recoded, continuous, constant-dollar equivalents and are used instead.
-- **Per-record NaN dropping.** GSS uses ballot-splitting (a given respondent only answers a subset of question modules) and skip logic (e.g. all spouse questions are inapplicable if unmarried). Across the 3,986 respondents, populated fields per record range from **17 to 86 of the 91 possible** (mean 65.3). The export drops unanswered fields per record rather than writing a literal `"nan"` into the prompt; `_format_record()` in `agents/personas.py` only ever sees fields the respondent actually has data for.
+**The line is attitude vs. fact.** Explicit attitude and opinion items are excluded whatever their topic, so no stance leaks into a persona; demographic and background facts are kept, including topically adjacent ones (citizenship, birthplace, migration history). Two data corrections: `CONINC`/`CONRINC` (continuous, constant-dollar) replace the top-coded `INCOME`/`RINCOME` brackets, and unanswered fields are dropped per record (ballot splitting leaves 17–86 of 91 fields populated, mean 65.3).
 
 ### Retained variables (91)
-
-Demographic/background *facts* (citizenship, birthplace, ancestry, migration history, language) are retained even though they are immigration-adjacent: they describe who the respondent is, not what they think government should do. Only explicit attitude/opinion items are excluded (see below). Socio-economic depth is maximized: occupational prestige and socioeconomic-index scores are included for the respondent, spouse, and both parents.
 
 | Category | Variables |
 |---|---|
@@ -266,27 +268,23 @@ Demographic/background *facts* (citizenship, birthplace, ancestry, migration his
 | **Religiosity** | Religious preference (current & raised in), denomination, service attendance, prayer frequency, self-rated religiosity |
 | **Values** | General happiness, belief about getting ahead in life, work centrality, value placed on hard work in raising children |
 | **Lifestyle** | TV hours per day |
-| **Moral item** | Approval of spanking children (mirrors the one moral item retained in the German pipeline) |
+| **Moral item** | Approval of spanking children |
 
 ### Excluded field categories
 
-Explicit attitude/opinion items removed to prevent stance leakage into persona descriptions; the line is drawn at *what the respondent believes policy should be*, not at demographic proximity to the topic:
-
-- **Immigration/asylum attitudes**: `LETIN1A`, `LETIN1`, `IMMCRIME(1)`, `IMMJOBS(1)`, `IMMFATE`, `LETINHSP`, `LETINASN`, `ADOPTUS`, `IMMAMECO`, `IMMASSIM`, `IMMWLFARE`, `TOPPROB2_IMMG`; these ask what policy should be, exactly the simulation's stance dimension
+- **Immigration/asylum attitudes**: `LETIN1A`, `LETIN1`, `IMMCRIME(1)`, `IMMJOBS(1)`, `IMMFATE`, `LETINHSP`, `LETINASN`, `ADOPTUS`, `IMMAMECO`, `IMMASSIM`, `IMMWLFARE`, `TOPPROB2_IMMG`
 - **Race/civil-rights attitudes**: `RACOPEN*`, `RACLIVE`, `RACDIF1-5`, `WRKWAYUP`, `WLTHWHTS/BLKS/HSPS`, `WORKWHTS/BLKS/HSPS`, `MARWHT/BLK/ASIAN/HISP`, `LIVEBLKS/WHTS`, `AFFRMACT`, `DISCAFF*`, `HELPBLK`, `DSNDNTPAY`
 - **Gender-role/political attitudes**: `FECHLD`, `FEPRESCH`, `FEFAM`, `FEPOL*`, `MEOVRWRK`, `FEOVRWRK`, `FEHIRE`, `FEJOBAFF`
-- **Party/vote/political views & national spending priorities**: `PARTYID`, `POLVIEWS`, `VOTE16`, `VOTE20`, `PRES16`, `PRES20`, `IF16WHO`, `IF20WHO`, all `NAT*` spending-priority items
-- **Institutional confidence/trust**: all `CON*` confidence items, `TRCONG`, `TRCOURTS`, `TRPPL`, `TRUST*`, `CANTRUST`, `FAIR*`, `HELPFUL*`
-- **Civil-liberties (Stouffer) tolerance items**: `SPKATH`/`COLATH`/`LIBATH`, `SPKRAC`/`COLRAC`/`LIBRAC`, `SPKCOM`/`COLCOM`/`LIBCOM`, `SPKMSLM`/`COLMSLM`/`LIBMSLM`
-- **Abortion**: all `AB*` items
-- **Government-intervention/tax policy**: `TAX`, `EQWLTH`, `HELPPOOR`, `HELPNOT`, `HELPSICK` (note `PARSOL`/`KIDSSOL`/`GOODLIFE` are *retained*: they ask about personal economic mobility, not government policy)
-- **Gun/crime/punishment policy**: `OWNGUN`, `ROWNGUN`, `PISTOL`, `RIFLE`, `SHOTGUN`, `HUNT*`, `GUNLAW`, `CAPPUN`, `GRASS`, `COURTS*`, `POL(HITOK|ABUSE|MURDR|ESCAP|ATTAK)`, `FEAR`
+- **Party, vote, political views and national spending priorities**: `PARTYID`, `POLVIEWS`, `VOTE16`, `VOTE20`, `PRES16`, `PRES20`, `IF16WHO`, `IF20WHO`, all `NAT*` items (including energy and environment spending)
+- **Institutional confidence/trust**: all `CON*`, `TRCONG`, `TRCOURTS`, `TRPPL`, `TRUST*`, `CANTRUST`, `FAIR*`, `HELPFUL*`
+- **Civil-liberties (Stouffer) items**: `SPK*`/`COL*`/`LIB*` for ATH, RAC, COM, MSLM
+- **Abortion**: all `AB*`
+- **Government intervention/tax**: `TAX`, `EQWLTH`, `HELPPOOR`, `HELPNOT`, `HELPSICK` (`PARSOL`/`KIDSSOL`/`GOODLIFE` are retained: personal mobility, not policy)
+- **Guns, crime, punishment**: `OWNGUN`, `ROWNGUN`, `PISTOL`, `RIFLE`, `SHOTGUN`, `HUNT*`, `GUNLAW`, `CAPPUN`, `GRASS`, `COURTS*`, `POL(HITOK|ABUSE|MURDR|ESCAP|ATTAK)`, `FEAR`
 - **Sex/marriage politics**: `SEXEDUC`, `TEENSEX`, `PREMARSX`, `PILLOK`, `MARSAME*`, `HOMOSEX`, `XMARSEX`, `DIVLAW*`, `PRAYER*`, `CHNGDOCS`, `ACPTTG`, `RELIGINF`, `SUICIDE*`, `LETDIE1`, `XMOVIE*`, `PORNLAW`
-- **Full topical modules excluded**: ANES; ISSP Digital Societies & National Identity; Adult & Child Mental Health Stigma (hypothetical-vignette judgments, not respondent self-description); High Risk Behaviors; GSS Next Follow-on
-- **Technical/paradata/household-roster/interviewer variables**: respondent ID, survey weights, `SAMPLE`, `YEAR`, `DATEINTV`, `BALLOT`, `FORM`, `INT*` (interviewer characteristics), `RLOOKS`, `RGROOMED`, `RESPOND`, `CONSENT`, `MODE`, `FEEUSED`, `SPANENG`, `VPSU`, `VSTRAT`, `KISH`, `DEVTYPE`, `WHOELSE*`, roster-linkage variables (`RELATE1-14`/`GENDER1-14`/`OLD1-14`/`MAR1-14`/`AWAY1-14`/`WHERE1-14`)
-- **Verbal-ability test battery**: `WORDA`-`WORDSUM*` (a cognitive test, not an attitude or demographic)
-
-The `_expand()` prompt in `agents/personas.py` then instructs the LLM to describe only life situation and personality from the retained attributes, without mentioning political opinions.
+- **Whole modules**: ANES; ISSP Digital Societies & National Identity; Mental Health Stigma vignettes; High Risk Behaviors; GSS Next Follow-on
+- **Technical, paradata, roster and interviewer variables**: IDs, weights, `SAMPLE`, `YEAR`, `DATEINTV`, `BALLOT`, `FORM`, `INT*`, `RLOOKS`, `RGROOMED`, `RESPOND`, `CONSENT`, `MODE`, `FEEUSED`, `SPANENG`, `VPSU`, `VSTRAT`, `KISH`, `DEVTYPE`, `WHOELSE*`, `RELATE/GENDER/OLD/MAR/AWAY/WHERE1-14`
+- **Verbal-ability test**: `WORDA`–`WORDSUM*`
 
 ---
 
@@ -295,363 +293,263 @@ The `_expand()` prompt in `agents/personas.py` then instructs the LLM to describ
 ### Round structure
 
 ```
-For each round (= INTERACTIONS_PER_ROUND events):
-  For each interaction:
-    1. Draw expresser   uniform random from agents with ≥1 neighbour
-    2. Draw responder   select_responder(β_sel) from expresser's neighbours,
-                        weighted by expresser's expected reward per neighbour
-    3. Softmax draw     softmax_a = softmax(β) over expresser's Q-values
-    4. Exchange         expresser speaks → responder reacts  (1 exchange each,
-                        both turns through the expression gate)
-                        First meeting: expresser responds to moderator's topic.
-                        Repeat meeting: expresser responds to partner's last message
-                        (continuation); topic always present in stance hint.
-    5. Reward           reward_a = graded(a's expression) · graded(b's reaction)
-    6. Q-update         Q(stance) ← (1−α)·Q(stance) + α·reward_a
-    7. Reward record    record_reward(reward_a), appends to edge's rolling
-                        history window (REWARD_WINDOW_M), feeding select_responder
-    8. Edge update      update_edge()  [GRAPH_DYNAMIC only]
-                        signal = mean(history[-REWARD_WINDOW_M:])
-                        (steps 6-8 fire only on a measured-reward round; all
-                         three frozen on abstention (ambiguous) or reward None)
-  After all interactions:
-    9. Reconnect        [GRAPH_DYNAMIC only] degree-0 agents reconnected
-   10. Reflection       if round % REFLECT_EVERY == 0: all agents reflect
-   11. Snapshot         Q-trajectories + polarization metrics → logs/
+For each round:
+  INTERACTIONS_PER_ROUND interactions, each as in "Interaction loop" above;
+  a rewire happens inside the loop, so later draws see a consistent graph.
+  Then: reflection (every REFLECT_EVERY rounds, MEMORY_ENABLED) and a snapshot.
 ```
 
 ### Initial topology, Stochastic Block Model
 
-The network is initialised as a **Stochastic Block Model** with `SBM_NUM_COMMUNITIES` communities. `SBM_P_INTRA` sets within-community density; `SBM_P_INTER` sets between-community density.
+A **fixed-edge-count two-block model**: `SBM_M_INTRA` of each block's `C(10,2) = 45` pairs (27, density exactly 0.6) and `SBM_M_INTER` of the `10 × 10 = 100` cross pairs, each layer a uniform draw from its own pair set, within-block layer first. Counts rather than probabilities because `NUM_AGENTS` is fixed at 20: under a probability a coupling level is a mixture over topology sizes (at `p = 0.02`, 13.3 % of draws have no cross edge at all). Drawing the within-block layer first gives one seed the same within-block graph at every coupling. `SBM_P_INTRA`/`SBM_P_INTER` survive as derived densities (`m/45`, `m/100`).
 
-`SBM_P_INTER` is the primary experimental variable: sweeping it from low to high reproduces SFT's polarization-to-consensus phase transition. At low coupling, agents mostly interact within their community, opinion clusters align structurally, and polarization is stable. At high coupling, cross-community feedback erodes conviction and drives consensus.
-
-Each node carries a `"community"` attribute for post-hoc structural analysis. Since 2026-07-19 the logger writes it into every round snapshot as a top-level `"communities"` map (agent name → community index), alongside `n_intra_edges` / `n_inter_edges` in the metrics — the basis for per-community regime classification (`test_schedule.md`, design principle 2).
+`SBM_M_INTER` is the primary experimental variable: low coupling sustains community-aligned polarization, high coupling drives consensus. `m = 0` (two disconnected blocks) is legal; the loop only draws expressers that have a neighbour. Nodes carry a `"community"` attribute, written into every snapshot as a `"communities"` map beside `n_intra_edges`/`n_inter_edges`, the basis of per-community regime classification.
 
 ### Graph dynamics
 
 | `GRAPH_DYNAMIC` | Behaviour |
 |---|---|
-| `False` (default) | Graph structure fixed for the full run; step 8 (`update_edge()`) and reconnection are skipped, step 7 (`record_reward()`) still runs on measured-reward rounds. Use for main SFT experiments to avoid confounding opinion dynamics with structural dynamics. |
-| `True` | Edge valuations evolve via `update_edge()`; edges severed at `STRENGTH_FLOOR`; isolated agents reconnected. Use for the homophilic tie-formation extension. |
+| `False` (default) | Graph fixed; `record_reward()` still runs on measured-reward rounds (it feeds `select_responder`) |
+| `True` | `update_edge()` steps valuations; a severed edge is **replaced in the same step** by `rewire_after_drop()`, so `|E|` is conserved. Isolates are not reconnected |
 
 ### Output
 
-Each run produces a timestamped directory under `logs/`:
-
 ```
-logs/run_<timestamp>/
-├-- personas.json              # agent names and persona descriptions
-├-- events.jsonl               # one JSON record per event
-└-- network_rounds/
-    ├-- round_0000.json        # baseline snapshot before round 1
-    ├-- round_0001.json
-    └-- ...
+logs/run_<id>/
+├-- params.json        resolved parameters + git_commit, model_digest, ollama_version (logger.log_params)
+├-- personas.json      agent names and personas
+├-- events.jsonl       one record per event
+└-- network_rounds/round_NNNN.json   round_0000 is the baseline before round 1
 ```
 
-**`events.jsonl`** event types:
-
-| `type` | Key fields |
+| `events.jsonl` `type` | Key fields |
 |---|---|
-| `discussion` | `round`, `agent_a` (expresser), `agent_b` (responder), `topic_label`, `turns` (each turn: `speaker`, `content`, and a `gate` record, see [expression gate](#sft-expression-gate)), `reward_a`, `reward_b`, `softmax_a`/`softmax_b` (softmax draw), `gate_attempts_a`/`gate_attempts_b` (drafts the agent's first turn needed), `gate_fallback_a`/`gate_fallback_b` (first turn reached the fallback cascade), `gate_final_expressed_a`/`gate_final_expressed_b` (accepted first-turn stance; feeds the Q-update index), `argmax_a`/`argmax_b` (argmax stance pre-update) |
+| `discussion` | `round`, `agent_a` (expresser), `agent_b`, `topic_label`, `opener_topic_first`, `turns` (each with its `gate` record), `reward_a`, `reward_b`, `softmax_a/b`, `cue_a/b`, `gate_attempts_a/b`, `gate_fallback_a/b`, `gate_final_expressed_a/b` (Q-update index), `gate_final_graded_a/b`, `argmax_a/b` (pre-update) |
 | `edge_maintained` | `round`, `agent_a`, `agent_b` |
-| `edge_dropped` | `round`, `agent_a`, `agent_b` |
-| `edge_added` | `round`, `agent_a`, `agent_b` |
+| `edge_dropped` | `agent_a` = the **initiator**, `agent_b`, `signal_severed`/`signal_other`, `strength_severed`/`strength_other` |
+| `edge_rewired` | `agent_a` (initiator), `agent_b` (new partner), `replaced`, `rule`; counted per round, the **realised** relocation rate |
+| `rewire_failed` | `agent_a`, `agent_b`, `rule`: empty pool, the degree drop stands (only under `reward_local`) |
 | `reflection` | `round`, `agent` |
 
-**`round_NNNN.json`** snapshot:
-
-```json
-{
-  "round": 5,
-  "idle_agent": null,
-  "nodes": ["Anna", "Ben", "Clara", "David"],
-  "edges": [{"a": "Anna", "b": "Ben", "strengths": {"Anna": 1.2, "Ben": 0.9}, "rounds_active": 3}],
-  "metrics": {
-    "density": 0.33,
-    "n_components": 1,
-    "avg_degree": 2.0,
-    "n_edges": 4,
-    "n_pos": 2,
-    "n_neg": 2,
-    "dispersion": 1.0,
-    "mean_q_gap": 0.12
-  },
-  "opinion_states": {
-    "Anna": {"q_pos": 0.18, "q_neg": 0.04, "argmax": 1, "softmax": 1, "q_gap": 0.14}
-  }
-}
-```
-
-`opinion_states` records the Q-trajectory for every agent after every round, enabling the interpretability check: testing whether Q-gap trajectories predict observed opinion switches.  `"argmax"` is the deterministic argmax over Q-values (always present); `"softmax"` is the softmax-drawn stance from the last interaction in which the agent was expresser (absent if the agent was never expresser in that round). Per-draft expressed stances are not snapshotted here; they live in the per-turn `gate` records in `events.jsonl` (see [expression gate](#sft-expression-gate)).
+A snapshot holds `round`, `elapsed_s`, `nodes`, `edges` (per-agent `strengths`, `rounds_active`), `metrics` (`density`, `n_components`, `avg_degree`, `n_edges`, `n_intra_edges`, `n_inter_edges`, `n_pos`, `n_neg`, `dispersion`, `mean_q_gap`), `communities`, and `opinion_states`: per agent `q_pos`, `q_neg`, `argmax`, `q_gap`, and `softmax` if it expressed that round. `n_pos`/`n_neg` count strict Q-gap signs, so tied agents are in neither.
 
 ---
 
 ## Pairwise mode
 
-Runs the identical SFT mechanisms as network mode for exactly two agents connected by a single edge. Each round consists of `INTERACTIONS_PER_ROUND` asymmetric interactions, with the expresser drawn uniformly at random each time.
-
-**What is absent:** SBM graph, community structure, reconnection (`ensure_connectivity`): with only two agents there is no alternative partner to reconnect to, so an edge severed under `GRAPH_DYNAMIC = True` ends the run early instead.
-
-**What is identical to network mode:** `select_responder()`, `record_reward()`, and `update_edge()` all run unchanged on a single-edge `nx.Graph` carrying one `EdgeData` instance, including the no-signal freeze (an abstention *or* an unparseable reward skips the reward record and edge update). `RESPONDER_SELECTION_BETA` has no effect on the outcome (only one possible responder), but the call still runs every interaction for mechanism parity.
-
-### Round structure
-
-```
-For each round (INTERACTIONS_PER_ROUND asymmetric interactions; expresser drawn uniformly):
-  For each interaction:
-    1. Draw responder  select_responder(β_sel), degenerates to the other agent
-    2. Softmax draw    softmax_stance = softmax(β) over expresser's Q-values
-    3. Exchange        expresser speaks → responder reacts  (1 exchange, both
-                       turns through the expression gate)
-                       First meeting: expresser responds to moderator's topic.
-                       Repeat meeting: expresser responds to partner's last message
-                       (continuation); topic always present in stance hint.
-    4. Reward          reward_a = graded(a's expression) · graded(b's reaction)
-    5. Q-update        Q(stance) ← (1−α)·Q(stance) + α·reward_a  [expresser only]
-    6. Reward record   record_reward(reward_a), appends to the edge's rolling
-                       history window (REWARD_WINDOW_M)
-    7. Edge update     update_edge()  [GRAPH_DYNAMIC only]
-                       signal = mean(history); may sever the edge and end the run
-                       (steps 5-7 fire only on a measured-reward round; all three
-                        frozen on abstention (ambiguous) or reward None, a
-                        no-signal round cannot sever the edge)
-  After all interactions:
-    8. Reflection      if round % REFLECT_EVERY == 0
-```
+The network mechanism for two agents on one edge, `INTERACTIONS_PER_ROUND = 2` (fixed locally), no communities. `select_responder()`, `record_reward()` and `update_edge()` run unchanged, including the no-signal freeze. A severance under `GRAPH_DYNAMIC` ends the run, since there is nobody to rewire to.
 
 ---
 
 ## Theoretical alignment
 
-| Banisch & Olbrich (2019) concept | This simulation |
+| Banisch & Olbrich (2019) | This simulation |
 |---|---|
-| Public opinion o_i ∈ {−1, +1} | Softmax stance drawn by `draw_softmax_stance(β)` and enforced at expression time by the [expression gate](#sft-expression-gate); deterministic argmax indicator is `argmax_stance` = `argmax(q_pos, q_neg)` (logged as `argmax_a/b`); round-opener and snapshot counts use strict Q-gap comparisons (`q_pos > q_neg` / `q_neg > q_pos`), so tied/neutral agents are excluded from n_pos and n_neg |
-| Social reward r = o_i · o_j ∈ {−1, +1} | `reward_from_expressions()` = graded(expresser) · graded(reaction) ∈ [−1.0, 1.0]: literally the opinion product, but with *graded* stances (each factor a topic-anchored `classify_expression_graded()` on a single turn) so it preserves ambivalence on a continuous scale. Symmetric by construction (see [Where the extension lives](#where-the-extension-lives-when-the-scalars-look-canonical)) |
-| Q-value update Q(o_i) ← (1−α)·Q(o_i) + α·r | `update_q_value(stance, reward, α)`, expresser only, per interaction; `stance = gate_final_expressed` (softmax draw under the gate; classified expressed stance in the ungated ablation arm). Skipped when the expression is ambiguous (`0` = strategic abstention) or the reward is unparseable |
-| Asymmetric one-directional update | One expresser drawn per event; only their Q updates (Jacob & Banisch 2023) |
-| Partner selection | `select_responder(β_sel)`, β_sel=0 uniform (2019); β_sel>0 weighted by the expresser's own expected reward per neighbour (extension beyond Jacob & Banisch 2023's static conviction-similarity homophily) |
-| Network co-evolution (endogenous) | `GRAPH_DYNAMIC = True`, extension mode |
-| Phase transition via modularity | `SBM_P_INTER` sweep, primary experimental variable |
-| Structural polarization | `dispersion`, `n_pos/n_neg` in round snapshots; n_pos/n_neg count agents with strict positive/negative Q-gap, excluding neutral agents |
-
-The continuous reward on [−1, +1] is a deliberate extension of Banisch's binary ±1, preserving ambivalent feedback that Sárközi et al. (2022) found most influential in empirical tests. An ambivalent reaction is scored `r = 0.0` and *applied*: it decays the expressed stance's Q toward 0 and thereby moderates conviction; see [How a reward moves the Q-values](#how-a-reward-moves-the-q-values) for the mechanism.
+| Public opinion o_i ∈ {−1, +1} | The softmax draw, enforced at expression by the gate; `argmax_stance` for metrics |
+| Reward r = o_i · o_j | `reward_from_expressions()`: the same product over graded stances in [−1, 1] |
+| Q(o_i) ← (1−α)·Q(o_i) + α·r | `update_q_value()`, expresser only, indexed on `gate_final_expressed`; skipped on no-signal rounds |
+| Asymmetric update | One expresser per interaction (Jacob & Banisch 2023) |
+| Partner selection | `select_responder(β_sel)`: β_sel = 0 uniform; > 0 reward-weighted, an extension beyond Jacob & Banisch's conviction-similarity homophily |
+| Network co-evolution | `GRAPH_DYNAMIC = True`: experience-based partner choice that never reads Q-values |
+| Phase transition via modularity | the `SBM_M_INTER` ladder |
+| Structural polarization | `dispersion`, `n_pos`/`n_neg` |
 
 ### Where the extension lives when the scalars look canonical
 
-> **Reward mechanism (changed 2026-07-17):** the scalar reward was moved from a *relational* `classify_reward()` judgement — an LLM rating one reaction against one statement — to the graded **opinion product** `graded(expresser) · graded(reaction)` (`reward_from_expressions()`). Motivation: across the five 2026-07-12/-17 runs the relational judge systematically under-scored *mutual rejection*, reading two agents who both opposed the topic as *disagreeing* 4–22 % of the time versus <4 % for mutual agreement, which handed the "favor" pole a reward edge and tilted every run toward a +1 consensus regardless of framing — a measurement artifact, not a substantive dynamic. The product form removes it by construction (both factors come from the same topic-anchored classifier, so mutual favor and mutual opposition are the identical problem). Pre-change reward figures below are retained as the historical baseline.
+Both LLM interfaces sit close to B&O by construction: the gate makes expressed equal drawn, and gated turns concentrate at ±1. Their *product* does not: a large share of applied rewards lies strictly between the poles, most of all in the early rounds, drifting toward the canon as opinions harden (pilot measurements: [`../analysis/design_analysis.ipynb`](../analysis/design_analysis.ipynb) § 2). The contribution therefore sits in the interfaces around dynamics that are deliberately canonical:
 
-In harvest data the two LLM interfaces come out close to Banisch's axioms: the gate guarantees the expressed stance equals the drawn one, and the graded expressions are strongly bimodal (run_1783771774: 191 of 223 pre-change measured rewards were exactly ±1.0, so the continuous-scale claim above should not be read as a realized continuous distribution). The Q-update loop therefore runs on near-canonical inputs. This does not reduce the simulation to a re-implementation of the canon; it relocates the contribution from the dynamics — deliberately kept canonical for comparability — to the interfaces around them:
+1. **A graded opinion product.** The canon's `r = o_i · o_j` over actually generated turns, recovering the binary product at ±1 and adding conviction and hedging to the feedback channel.
+2. **Asymmetries the canon cannot generate.** The model resists one pole more than the other at a rate measurable from the gate records, a drift source from the language substrate itself.
+3. **Expression friction as a measured construct.** B&O's expression is frictionless; the gate's rejected drafts measure the gap between holding and voicing a stance, per agent, direction and round.
+4. **No-signal states.** Abstentions and unscorable reactions freeze a round; neutral feedback (`0.0`, applied) stays distinct from absent feedback (`None`).
+5. **A discourse corpus under the dynamics.** Every scalar traces to text, enabling argument-level analyses (e.g. whether stage-3 template turns cluster in one camp).
+6. **Non-stationary expression.** Memory, reflection and the cue make generation state-dependent, so expression friction can drift within a run.
 
-1. **The reward is a graded opinion product.** In the canon, r = o_i · o_j is a definition over binary opinions. Here r is the same product, but each factor is a graded, topic-anchored reading of an *actually generated* turn (`classify_expression_graded()`), the endpoint of a causal chain: partner's Q-values → softmax draw → gated text generation → graded stance of the reaction. The product form recovers the binary opinion product exactly at the ±1 endpoints and fills in the intermediate magnitudes the canon cannot express; the graded residuals are conviction/hedging in the feedback channel, a quantity the classical model has no vocabulary for.
-2. **Asymmetries the canon cannot generate.** Expression: the model prior resists one pole more than the other (run_1783771774 gate rate 33.5 % for target −1 vs 4.4 % for +1). This asymmetry enters from the language substrate and has dynamical consequences (drift toward the favored pole) that the symmetric canon cannot produce from its own assumptions. (A second, *feedback-side* asymmetry — mutual rejection under-scored relative to mutual agreement — was a property of the pre-2026-07-17 relational reward, diagnosed as a classifier artifact and removed with the switch to the product form; it is not a substantive feature. See the reward-mechanism note at the head of this subsection.)
-3. **Expression friction as a measured construct.** Banisch's expression channel is frictionless: internal opinion maps to expressed opinion at zero cost, identically for all agents. The gate's rejected-draft telemetry operationalizes the gap between holding and voicing a stance — per agent, per direction, per round — while containing it dynamically (see [The intuition](#the-intuition) and [The gate record](#the-gate-record-persona-field-telemetry)).
-4. **No-signal states.** UNRELATED reactions, unparseable labels, and ambiguous expressions freeze the Q-update and edge dynamics for that round; the canon updates on every interaction. Neutral feedback (AMBIVALENT → 0.0, applied) stays distinct from absent feedback (None, skipped).
-5. **A discourse corpus under the dynamics.** Every scalar traces to auditable text: drafts, accepted expression, reaction, classifier reasoning. This enables argument-level analyses the scalar framework cannot produce even in principle — e.g. detecting that stage-3 template turns (7.1 % of all turns in run_1783771774, concentrated in the model-disfavored camp) formulaize inter-camp discourse and inject near-maximal rewards.
-6. **Non-stationary expression.** Memories and reflection make text generation state-dependent beyond Q, so the expression friction measured in (3) can drift over a run; the canon's expression channel has no state besides Q.
+### Design decisions
+
+- **Neutral initialisation.** Q starts at (0, 0) rather than at an LLM-elicited opinion, which would inject model bias (Chuang et al. 2024) at step 0.
+- **Inverse temperature β.** `p(+1) = σ(β·Δq)` as in B&O; a tie is a fair coin at every β, so agents split 50/50 at start without jitter.
+- **Asymmetric, one-exchange interactions** (Jacob & Banisch 2023): agents learn from the reaction to what *they* said; `last_message_to[(speaker, listener)]` lets repeat meetings continue the dialogue.
+- **Reward-based partner choice** (`β_sel`): expressers return to partners who rewarded them, which can build echo chambers through reinforcement without assuming similarity. `select_responder` stays a standalone unit so a multi-platform neighbour set (Jacob & Banisch 2023) slots in without touching the loop.
+- **Two-block topology** rather than Watts-Strogatz: it gives a clean coupling knob for the phase transition.
+- **Sequential by construction.** Every interaction mutates state the next draw reads, so a run cannot be parallelised internally without becoming a synchronous-update model. Parallelism is across runs: one job per sub-stage, many jobs per node (RUNBOOK § Kurzfassung). Reflection is the only safely parallel phase within a run; it is not parallelised.
 
 ---
 
 ## Requirements
 
 - Python 3.10+
-- Ollama ≥ 0.30.10 running at `127.0.0.1:11500` (see RUNBOOK.md for startup flags)
-- Models pulled: `qwen3.5:35b` (LLM only, embeddings use `sentence-transformers`, no Ollama model needed)
+- Ollama 0.34.0 (pinned for the confirmatory schedule; `qwen3.8` needs ≥ 0.32.12) at `127.0.0.1:11500`, the `OLLAMA_HOST` default; batch jobs use a per-job port
+- Models: `qwen3.8-nodraft:27b`, plus `devstral-small-2:24b` and `gemma4-nodraft:26b` for Bracket E. The `-nodraft` tags are the pulled `qwen3.8:27b` / `gemma4:26b` with `PARAMETER draft_num_predict 0`: Ollama 0.34.0's automatic speculative decoding crashes the llama-server on load. Speculative decoding preserves the sampled distribution, so disabling it costs speed only (RUNBOOK.md § Modelle pullen, step 3)
 
 ```bash
 pip install -r requirements.txt
 ```
 
----
-
 ## Usage
 
 ```bash
-python main_network.py   # full SFT network simulation
-python main_pairwise.py  # two-agent mode, same SFT Q-layer on a single-edge graph
+python main_network.py   # network simulation
+python main_pairwise.py  # two-agent mode
 ```
 
-For a quick smoke test, set in `config.py`:
-
-```python
-NUM_AGENTS         = 4
-NETWORK_MAX_ROUNDS = 3
-# INTERACTIONS_PER_ROUND is derived from NUM_AGENTS in config.py
-```
-
-Network mode uses `INTERACTIONS_PER_ROUND` from `config.py` (defaults to `NUM_AGENTS`).
-Pairwise mode hardcodes `INTERACTIONS_PER_ROUND = 2` locally (one interaction per role direction per round), so changing the config value has no effect there.
-
-On startup, personas are sampled from `data/gss_personas.json` (3,986 US General Social Survey records, see "Persona pool" above). The LLM generates a realistic American first name and 2-3 sentence persona description from each record's demographic and attitudinal attributes. All agent prompts and responses run in English.
-
----
+For a smoke test set `NUM_AGENTS = 4` and `NETWORK_MAX_ROUNDS = 3` in `config.py`. The simulation needs a GPU Ollama server; on the SCC it runs through `run_stage.sh` ([RUNBOOK.md](RUNBOOK.md)).
 
 ## Parameter sweeps (`run_sweep.py`)
 
-For grid exploration over experimental variables, `run_sweep.py` launches
-`main_network.py` once per parameter combination, each as its own subprocess:
-
 ```bash
-python run_sweep.py --dry-run      # print the grid without running anything
-python run_sweep.py                # run the grid sequentially
-python run_sweep.py --workers 3    # run up to 3 combinations in parallel
+python run_sweep.py --dry-run      # print the grid
+python run_sweep.py --workers 3    # up to 3 grid points in parallel
 ```
 
-**How it works**
-
-- `PARAM_GRID` in `run_sweep.py` defines the grid as lists of values per
-  `SIM_*` environment variable (e.g. `SIM_SBM_P_INTER`, `SIM_RESPONDER_SELECTION_BETA`,
-  `SIM_OPINION_BETA`, `SIM_GRAPH_DYNAMIC`). `config.py` reads these via `os.getenv(...)`, falling
-  back to its normal defaults when unset, running `main_network.py` directly
-  is unaffected.
-- `COMMON_OVERRIDES` applies to every combination (defaults to a small
-  `NUM_AGENTS`/`NETWORK_MAX_ROUNDS` pilot configuration); adjust once the
-  pipeline is validated.
-- Each combination gets a tagged run directory `logs/run_sweep_<sweep_ts>_<index>/`
-  via `SIM_RUN_ID`, and the full grid (parameters, return code, duration, log
-  path) is written to `logs/sweeps/<sweep_ts>/manifest.json` for joining results
-  back to the parameters that produced them.
-
-**Parallelization**: `--workers > 1` runs grid points concurrently as
-independent OS processes; see `PLAN_parallelization_strategy.md` for how this
-interacts with intra-run parallelism and Ollama/vLLM concurrency limits.
-
----
-
-## Persona-field analysis (`analyze_gate.py`)
-
-The persona field, how strongly each agent's persona pulls its generated text off the softmax-drawn stance, is now measured from the [expression gate](#sft-expression-gate) records rather than by a separate audit. `analyze_gate.py` mines `events.jsonl` post-hoc (zero LLM cost, no Ollama needed): it reads each turn's `gate` record and reports, per anchored stance, **first-attempt fidelity** (does the first, unconstrained draft keep the drawn stance?) alongside the graded extension the old scalar lacked, retry counts, fallback/template rates, and a two-proportion test on the +1-vs-−1 fidelity asymmetry.
-
-```bash
-python analyze_gate.py --runs logs/run_<ts> [logs/run_<ts2> ...]   # first-attempt fidelity, retry & cascade stats (no LLM)
-python analyze_gate.py --runs logs/run_<ts> --drift                # also semantic drift across drafts (loads embeddings)
-```
-
-Results go to `logs/analysis/<timestamp>/gate.json` and are echoed to stdout. First-attempt fidelity is exactly the estimand the retired `audit_reward.py fidelity` mode reported, the persona field's pull on the unconstrained draft distribution, but with the whole rejection-sampling history behind it. By design decision this field is **kept, measured, and studied**: the conflict between social-feedback learning and the persona field is a central study object of the thesis, not a defect to be prompted away.
-
-Historical baseline (2026-07-03, β=0 harvest, retired `audit_reward.py` on the earlier restrictive-immigration wording): the **reward channel was approximately direction-symmetric** (synthetic Gate A PASS, mean Δ = −0.04), while the **generation channel carried a strong persona field**: agents anchored anti-restriction held their stance in 43% of utterances vs. 84% pro-restriction (p < 10⁻⁸), spot-checked as genuine persona-grounded drift. These numbers predate both the gate and the switch to the nuclear-power topic (`topic_candidates.md`); re-harvest under the current `TOPIC_TEXT` with `analyze_gate.py` before citing them for new runs. See `test_schedule.md` for the full rationale.
+`PARAM_GRID` maps `SIM_*` names to value lists; each combination runs `main_network.py` as its own subprocess with a tagged log directory, and `logs/sweeps/<ts>/manifest.json` records the grid. Every grid name is checked against `SUPPORTED_OVERRIDES`, the names `config.py` reads, and an unknown name **aborts**: an ignored override produces a complete, plausible run at the wrong parameters.
 
 ---
 
 ## Configuration (`config.py`)
 
-`SBM_P_INTER`, `SBM_P_INTRA`, `RESPONDER_SELECTION_BETA`, `OPINION_BETA`, `GRAPH_DYNAMIC`, `NUM_AGENTS`, and
-`NETWORK_MAX_ROUNDS` can each be overridden via a `SIM_*` environment variable
-(e.g. `SIM_SBM_P_INTER=0.3`, `SIM_GRAPH_DYNAMIC=1`) without editing this file,
-see [Parameter sweeps](#parameter-sweeps-run_sweeppy).
+Every tunable lives in `config.py`, with no magic numbers elsewhere. The names in `run_sweep.SUPPORTED_OVERRIDES` are read as `SIM_<NAME>`, which is how `run_stage.sh` gives each queued job its own physics. **No override, on purpose:** `NUM_AGENTS` and `NETWORK_MAX_ROUNDS` (fixed for the whole confirmatory schedule, edited before submitting), `STRENGTH_DELTA` (derived) and `INITIAL_EDGE_STRENGTH` (the unit of the valuation axis). What a run actually used is its `params.json`.
 
 ### Shared (both modes)
 
 | Setting | Default | Description |
 |---|---|---|
-| `LLM_MODEL` | `qwen3.5:35b` | Ollama model for all LLM calls |
-| Embeddings | `paraphrase-multilingual-MiniLM-L12-v2` | Via `sentence-transformers` on CPU; no Ollama model required |
-| `reasoning` | `False` | `OllamaLLM` constructor arg (both entry points). Disables thinking mode on supported models (e.g. `qwen3.5:35b`). With thinking mode on, the model prepends `<think>…</think>` to every response; `_score_importance()` parses the first token as a float and silently falls back to `5.0`, breaking memory-importance scoring. `classify_expression_graded()` is robust to this, it constrains the reply via Ollama's JSON-schema `format` parameter to `{"reasoning": str, "label": <enum>}` and reads the `label` field, so free text (including leading `<think>` content) never has to be parsed, but `reasoning=False` still avoids the wasted generation time. `langchain-ollama ≥ 0.3.4` maps this field to Ollama's native `think` parameter. |
-| `NETWORK_MAX_ROUNDS` | `25` | Total rounds; snapshot unit in network mode, loop bound in pairwise mode |
+| `LLM_MODEL` | `qwen3.8-nodraft:27b` | Agent, generator and grader at once. `SIM_LLM_MODEL` lets Stage 8 queue beside default-model jobs |
+| Embeddings | `paraphrase-multilingual-MiniLM-L12-v2` | `sentence-transformers` on CPU |
+| `reasoning` | `False` | `OllamaLLM` argument in both entry points. Thinking mode would prepend `<think>` blocks that break `_score_importance()`'s float parse (silent fallback 5.0); the classifier is schema-constrained and robust, but thinking still costs time |
+| `NETWORK_MAX_ROUNDS` | `100` | The horizon. Set for the confirmatory schedule by screen `A-00` (the pilot ran 25 and 100) |
+| `MEMORY_ENABLED` | `True` | `False` = Stage 4's memory ablation (`SIM_MEMORY_ENABLED`) |
 | `REFLECT_EVERY` | `5` | Reflection frequency (rounds) |
-| `MAX_MEMORIES_SEED` | `15` | Recent memories fed to reflection prompt |
-| `MAX_MEMORIES_RETRIEVE` | `5` | Memories retrieved per `respond()` call |
+| `MAX_MEMORIES_SEED` | `15` | Recent memories fed to reflection |
+| `MAX_MEMORIES_RETRIEVE` | `5` | Memories retrieved per call |
 | `MEMORY_PERSIST` | `False` | Persist ChromaDB to disk |
-| `WEIGHT_RECENCY` | `0.25` | Composite retrieval score weight, recency (see [Memory system](#memory-system)) |
-| `WEIGHT_IMPORTANCE` | `0.25` | Composite retrieval score weight, importance |
-| `WEIGHT_RELEVANCE` | `0.3` | Composite retrieval score weight, relevance |
-| `WEIGHT_STANCE_CONGRUENCE` | `0.2` | Composite retrieval score weight, stance congruence with the retrieving agent's current `softmax_stance`; motivated-recall strength knob |
-| `STRENGTH_CAP` | `3.0` | Ceiling on per-agent strength/edge valuation |
-| `STRENGTH_FLOOR` | `0.0` | Termination threshold: conversation/edge ends when either agent's value ≤ this |
-| `STRENGTH_DELTA` | `0.5` | Strength change per interaction = mean_reward × STRENGTH_DELTA |
-| `REWARD_WINDOW_M` | `5` | Rolling reward-history window per edge (interactions). Recorded via `record_reward()` on measured-reward rounds and feeds `select_responder`; drives edge-strength updates only when `GRAPH_DYNAMIC = True` |
-| `INTERACTIONS_PER_ROUND` | `= NUM_AGENTS` | Asymmetric interactions per snapshot round, network mode only (pairwise hardcodes 2 locally); expresser drawn uniformly each time |
+| `WEIGHT_RECENCY` / `_IMPORTANCE` / `_RELEVANCE` / `_STANCE_CONGRUENCE` | `0.25` each | Retrieval weights ([Memory system](#memory-system)); congruence is the motivated-recall knob |
+| `INTERACTIONS_PER_ROUND` | `= NUM_AGENTS` | Network mode only |
 
-### SFT Q-learning (both modes)
+### SFT Q-learning
 
 | Setting | Default | Description |
 |---|---|---|
-| `LEARNING_RATE` | `0.1` | α in Q(o) ← (1−α)·Q(o) + α·r |
-| `OPINION_BETA` | `5.0` | β: softmax inverse temperature; β=0 → 50/50, β→∞ → argmax |
-| `RESPONDER_SELECTION_BETA` | `0.0` | β_sel: responder-selection inverse temperature; 0 = uniform (2019 baseline), >0 = weighted by expresser's expected reward per neighbour |
+| `LEARNING_RATE` | `0.1` | α |
+| `OPINION_BETA` | `5.0` | β. Every confirmatory arm except Stage 2 runs `inf` (deterministic argmax) via `run_stage.sh` |
+| `RESPONDER_SELECTION_BETA` | `0.0` | β_sel; 0 = uniform |
+| `CONVICTION_CUE_ENABLED` | `True` | [The conviction cue](#the-conviction-cue); `SIM_CONVICTION_CUE=0` is the ablation |
+| `STANCE_BRIDGE_ENABLED` | `False` | `True` molds persona and stance into cached per-stance justifications (`SIM_STANCE_BRIDGE=1`) |
+| `SFT_GATE_ENABLED` | `True` | `False` = one ungated draft, the ablation (no override) |
+| `SFT_GATE_MAX_ATTEMPTS` | `5` | Attempt budget per cascade stage |
+| `SEED` | OS entropy | Seeds the persona records drawn (not their LLM-expanded texts) and the topology only (`SIM_SEED`; `run_stage.sh` takes a `SEED_BLOCK` instead) |
 
-With rewards in `[-1, 1]` and `LEARNING_RATE = 0.1`, typical Q-gaps after a few interactions fall around `0.1-0.5`. The probability of drawing the argmax stance as the softmax stance is `exp(β·q_pos) / (exp(β·q_pos) + exp(β·q_neg)) = 1 / (1 + exp(-β·gap))`, so at `β=5.0` a gap of `0.2` already yields `≈88%` (near-deterministic), whereas `β=1.0-2.0` yields `≈55-73%` for the same gap, a softer preference that still favours the higher Q-value while leaving room for noise.
-
-### SFT expression gate (both modes)
-
-| Setting | Default | Description |
-|---|---|---|
-| `SFT_GATE_ENABLED` | `True` | Enforce the softmax-drawn stance output-side via rejection sampling (see [expression gate](#sft-expression-gate)). `False` = single ungated draft (Step A soft anchoring), the ablation/comparison arm. A plain boolean in `config.py`, edit it directly (no `SIM_*` override) |
-| `SFT_GATE_MAX_ATTEMPTS` | `5` | Per-stage attempt budget: up to this many soft-prompt drafts, then up to this many context-free fallback drafts, then the fixed template |
+At finite β, `p(argmax) = σ(β·|Δq|)`: a gap of 0.4 gives 88 % at β = 5 and 60–69 % at β = 1–2.
 
 ### Network topology
 
 | Setting | Default | Description |
 |---|---|---|
-| `NUM_AGENTS` | `20` | Agents in the network graph |
-| `SBM_NUM_COMMUNITIES` | `2` | Number of blocks in the SBM graph |
-| `SBM_P_INTRA` | `0.7` | Within-community edge probability, independent constant, env-overridable via `SIM_SBM_P_INTRA` |
-| `SBM_P_INTER` | `0.02` | Between-community edge probability, **sweep this for the phase transition** |
+| `NUM_AGENTS` | `20` | |
+| `SBM_NUM_COMMUNITIES` | `2` | Required by the count parameterisation |
+| `SBM_M_INTRA` | `27` | Within-block edges per block, of 45 |
+| `SBM_M_INTER` | `15` | Cross-block edges, of 100: **the phase-transition axis**. Queued jobs take it from `run_stage.sh` |
+| `SBM_P_INTRA` / `SBM_P_INTER` | derived | Densities; `SIM_SBM_P_*` raises at import |
 
-### Graph dynamics (network mode, `GRAPH_DYNAMIC = True` only)
+### Graph dynamics (`GRAPH_DYNAMIC = True` only)
 
 | Setting | Default | Description |
 |---|---|---|
-| `GRAPH_DYNAMIC` | `False` | Enable endogenous tie rewiring via edge valuations |
+| `GRAPH_DYNAMIC` | `False` | Endogenous rewiring |
+| `REWIRE_RULE` | `"reward_local"` | **RQ2 factor**: `"random"` (any non-neighbour, the churn-only null), `"reward_local"` (2-hop only; every new tie closes a triangle), `"off"` (sever without replacement) |
+| `REWIRE_BETA` | `5.0` | Partner-choice decisiveness, `exp(REWIRE_BETA · referral estimate)`; watch `std_degree` / `assort_degree` for hub collapse |
+| `REWIRE_TIMESCALE_RATIO` | `3.0` | **w**, see below. Every dynamic sub-stage takes it from screen `D-01` (rule R2); `7-03` pins 1.0 |
+| `STRENGTH_CAP` | `3.0` | Valuation ceiling (`SIM_STRENGTH_CAP`, screening only) |
+| `STRENGTH_FLOOR` | `0.0` | Severance threshold |
+| `REWARD_WINDOW_M` | `5` | Rolling reward window per edge; also read by `select_responder` at β_sel > 0 (`SIM_REWARD_WINDOW_M`, screening only) |
+| `INITIAL_EDGE_STRENGTH` | `1.0` | Founding-edge valuation and the unit of the axis: the dynamics depend only on `CAP / INITIAL` and `NEW / INITIAL` |
+| `NEW_EDGE_STRENGTH` | `0.5` | Valuation of a rewired tie: less robust than an established one, and safe from instant re-cutting because its empty history reads 0.0 (`SIM_NEW_EDGE_STRENGTH`, screening only) |
+| `STRENGTH_DELTA` | derived, `0.3` | `w · α · INITIAL_EDGE_STRENGTH`; echoed at startup |
+
+**Timescale separation.** Coevolution outcomes depend on the ratio of opinion to rewiring rates, and with `|E|` conserved the strength parameters only set how often a relocation fires, so they collapse into one dial:
+
+```
+τ_opinion = 1 / LEARNING_RATE,  τ_rewire = INITIAL_EDGE_STRENGTH / STRENGTH_DELTA
+w = τ_opinion / τ_rewire
+```
+
+`w ≪ 1` recovers the static graph continuously, as a limit; `w ≫ 1` lets structure outrun opinion (fragmentation). The pilot's null screens (`0c-04`, `0c-09`, [`../analysis/test_schedule.md`](../analysis/test_schedule.md) § Stage 0c) found the static baseline at `w ≤ 0.5` and the sorting/mixing turnover near `w ≈ 1.2`; the confirmatory value comes from `D-01`. `w` is **nominal**: it assumes `|mean reward| = 1`, ignores the cap, and an edge of a degree-k agent is touched only every ~k expresser turns, so report the realised rate (`edge_rewired` per round) beside it. The LLM's own conformity timescale (~1–3 rounds) cannot enter `w`; locate it from Bracket A before submitting the `w = 1.0` probe `7-03`.
 
 ### Topic
 
 | Setting | Default | Description |
 |---|---|---|
-| `TOPIC_LABEL` | `"Energy Policy"` | Short identifier used in console output and `events.jsonl` |
-| `TOPIC_TEXT` | *(nuclear-power expansion statement)* | The discussion statement passed to agents as the opening moderator message; wording rationale in `topic_candidates.md` |
+| `TOPICS` | registry | `nuclear`, `renewables`, `coffee_tea`: each a pairwise comparison with `text` (+1), `opposite` (−1, the comparison reversed) and two opener wordings (rationale: [`topic_candidates.md`](topic_candidates.md)) |
+| `TOPIC_KEY` | `"nuclear"` | `SIM_TOPIC`; Stage 5 selects the other two |
+| `TOPIC_TEXT` | nuclear power does more good than harm | The +1 pole and the classifier's answer A. `_stance_pole()` maps −1 to `TOPIC_TEXT_OPPOSITE`, so no prompt states a stance as opposition |
+| `TOPIC_TEXT_OPPOSITE` | nuclear power does more harm than good | The −1 pole, answer B. **Derived from `TOPIC_TEXT`**, so Stage 3's flip (the opposite as `SIM_TOPIC_TEXT`) swaps both answers |
+| `TOPIC_OPENER` / `_SWAPPED` | the entry's wordings | Drawn per exchange (`draw_opener`), logged as `opener_topic_first`. Never shown to the classifier, and read only by the expresser on a first meeting |
 
-A single fixed topic is required for Q-value coherence: the +1/−1 stance dimension must refer to the same opinion object throughout the run. Multi-topic schedules are deliberately not supported; see `PLAN_banisch_opinion.md` for the rationale.
-
-For now, no too controversial topic should be selected, as LLM's guard rails on extreme opinions can be triggered.
+One topic per run keeps the ±1 dimension on one opinion object. Selection criteria (crisp binary, low model lean, guardrail-safe, contested, flippable) are argued in `topic_candidates.md`.
 
 ---
 
 ## Conventions
 
-**Language**: all LLM prompts and agent outputs are in English (US context since the GSS persona migration). Code, docstrings, comments, and logs are in English.
-
-**Config**: all tunables live in `config.py`. No magic numbers in source files.
-
-**Asymmetric update**: only the expresser's Q-value is updated per interaction. The responder's Q-value is unchanged. This is the core SFT mechanism; do not add a symmetric update without revisiting the theoretical alignment.
-
-**Q-update consistency**: `update_q_value()` takes the stance it updates as an explicit parameter, never the argmax. The reward is a response to what was actually said, so the index must be the stance that entered the interaction: the main loops index on the expresser's `gate_final_expressed` (see [expression gate](#sft-expression-gate)). Under the gate the accepted text is on-stance or ambiguous by construction, so a performed update indexes the softmax draw; in the ungated arm it is the classified expressed stance. The update is **skipped** when that stance is `0`/ambiguous (a strategic abstention, the agent put no stance up for evaluation) or when the reward is unparseable. Don't reintroduce a separate expressed-stance channel in the main loops; the gate record already carries it.
-
-**Edge drop rule**: threshold-based. An edge is severed when *either* agent's valuation falls to or below `STRENGTH_FLOOR`. Valuation is updated from the rolling mean of the agent's `reward_a` history on that edge (window `REWARD_WINDOW_M`), populated by `record_reward()` on measured-reward rounds. Active only when `GRAPH_DYNAMIC = True`; frozen on a no-signal round, abstention or unparseable reward, which therefore cannot sever an edge (see [expression gate](#sft-expression-gate)).
-
-**`select_responder`**: the partner-selection function is kept as a standalone swappable unit. The virtual-worlds multi-platform extension (Jacob & Banisch 2023) slots in here by replacing the neighbour set, not by changing the main loop.
-
-**Logging**: `SimulationLogger` writes to `logs/run_<timestamp>/`. Pass SFT metrics via `extra_metrics` and Q-snapshots via `opinion_states` to `snapshot_network()`. Community membership and intra/inter edge counts are derived inside the logger from the graph's `"community"` node attributes (every snapshot incl. round 0; omitted in pairwise mode, whose graph has no such attributes).
+- **Language**: English prompts and outputs (US context); code, comments and logs in English.
+- **Asymmetric update**: only the expresser's Q moves; do not add a symmetric update without revisiting the theoretical alignment.
+- **Q-update index**: `update_q_value()` takes the stance explicitly, never the argmax; the main loops pass `gate_final_expressed`. Do not reintroduce a separate expressed-stance channel.
+- **Edge severance**: when either valuation reaches `STRENGTH_FLOOR`; `update_edge()` returns the initiator (lower valuation if both cross, ties to the expresser), and only it rewires. A no-signal round cannot sever.
+- **Partner choice never reads opinion state**, 1-hop or 2-hop: scoring on opinion similarity would reinstate the homophily SFT derives around.
+- **Logging**: pass SFT metrics via `extra_metrics` and Q-states via `opinion_states` to `snapshot_network()`.
 
 ### What not to change without good reason
 
-- `classify_expression_graded()` prompt: minimal single-text context is deliberate; adding persona/transcript context, or making it judge one text *against another*, re-couples expression and evaluation and reintroduces the relational asymmetry the reward product exists to avoid
-- `reasoning=False` in the `OllamaLLM` constructor: keeps thinking-mode models (e.g. `qwen3.5:35b`) from prepending `<think>…</think>` blocks that corrupt the first-token float parse in `_score_importance()`. `classify_expression_graded()` no longer parses free text at all; it uses `_invoke_labeled()`, which constrains the reply via Ollama's JSON-schema `format` parameter to `{"reasoning": str, "label": <enum>}`, but disabling thinking still avoids the extra latency
-- `respond()` position-taking instruction: a legible stance is required for reward detection to work
-- The [expression gate](#sft-expression-gate) pass criterion: ambiguous (`0`) drafts **pass** (only a genuine flip triggers a retry). Rejecting them would spend retries on legibility noise and contaminate the retry-count persona-pressure measure. Likewise, `_final_fallback_reply()` is tagged on-stance *without* re-classifying: if you change `TOPIC_TEXT`, verify once that `classify_expression()` reads both stance templates as intended
-- The **soft stance anchoring** in `respond()`/`_mold_stance()` (Step A): the deliberate *absence* of a hard anti-drift constraint in the generation prompt. The persona field's pull on the draft is a measured study object, the social-feedback-vs-persona-field tension, not a bug. Do not harden the prompt itself: the [expression gate](#sft-expression-gate) (Step B) enforces the drawn stance *output-side* by rejection sampling precisely so this prompt can stay soft and the first draft of every turn keeps sampling the unconstrained distribution (which is what `analyze_gate.py` measures). Revisit the Stage 0b design decision in `test_schedule.md` before touching this
-- `memory/scoring.py` recency/importance/relevance weights (0.25/0.25/0.3): tuned composite retrieval. `WEIGHT_STANCE_CONGRUENCE` (0.2) is the exception: it's a deliberate experimental knob for motivated-recall strength, not a tuned constant; see [Memory system](#memory-system)
-- `LEARNING_RATE` and `OPINION_BETA` together govern the convergence rate; change them together and re-run the phase-transition baseline
+- **The classifier prompt** (`graded_stance_prompt()`): minimal, single-text and absolute. Adding context or making it relational re-couples expression and evaluation. The two-answer form keeps favor/oppose vocabulary out; the audit imports this function rather than copying it.
+- **`reasoning=False`** in both `OllamaLLM` constructors.
+- **The position-taking instruction** in `respond()`.
+- **The gate's pass rule**: abstentions (`BALANCED`/`NEITHER`) pass; a frame break is kept out by the rubric (`UNRELATED`), not by the gate second-guessing a `0`.
+- **Positive pole anchoring** (`_stance_pole()`): a "you oppose X" anchor yields drafts scored `NEITHER` on the −1 side only, a stance-dependent no-signal rate.
+- **The soft generation prompt**: the gate enforces output-side precisely so the first draft keeps sampling the persona's unconstrained pull.
+- **`LEARNING_RATE` and `OPINION_BETA`** together set the convergence rate; change them together and rerun the phase-transition baseline.
+- **The plain-Python loop.** The simulation was first built on LangGraph, whose compile-time graph fits neither stochastic expresser/responder draws nor a rewired topology; the explicit loop keeps the sequential-update semantics visible. `langchain-ollama` stays as the LLM client.
 
 ---
 
 ## Extension: endogenous tie formation
 
-The main experiments hold the graph fixed (`GRAPH_DYNAMIC = False`) to isolate opinion dynamics from structural dynamics. The extension chapter activates tie rewiring by setting `GRAPH_DYNAMIC = True`:
+With `GRAPH_DYNAMIC = True`, each measured-reward round steps the expresser's valuation by its rolling mean reward on that edge. When either valuation reaches the floor the edge is severed, and the **initiator** opens a replacement tie in the same step (`rewire_after_drop()`).
 
-- After each measured-reward interaction, `record_reward()` appends `reward_a` to the expresser's rolling history deque on that edge (`EdgeData.reward_history`, window `REWARD_WINDOW_M`); this runs in both graph modes, also feeding `select_responder`. The rolling mean drives the expresser's strength update via `update_edge()`. A no-signal round, an abstention (ambiguous expression) or an unparseable reward, skips both, so it neither records a reward nor rewires the graph.
-- Edges are severed when either agent's valuation reaches `STRENGTH_FLOOR`.
-- Isolated agents are reconnected via `ensure_connectivity()`.
+**Why cutting became relocating.** Delete-only dynamics thin the graph monotonically, and falling density produces fragmentation on its own, confounding the structural measurement. Relocation fixes `|E|` at no LLM cost and keeps dynamic runs comparable to static ones. Only the initiator keeps its degree, so the degree *distribution* moves while `|E|` and mean degree stay flat, which is a correctness check, never a finding. The one leak is `rewire_failed` (empty 2-hop pool, `reward_local` only): count it per run.
 
-Known failure modes: (1) the graph crystallising before Q-values diverge: keep `STRENGTH_DELTA` small relative to `LEARNING_RATE`; (2) premature edge drops before the history window fills: cold-start signal defaults to 0.0 (neutral) until `REWARD_WINDOW_M` interactions have accumulated on that edge.
+**No reconnection.** An agent left at degree zero sits out until another agent's rewire picks it. Under `"random"` that remains possible; under `"reward_local"` it cannot happen, because an isolate has no neighbours to be reached through. Reconnecting would mask the attrition the extension measures; it shows in `n_components` and `avg_degree`.
+
+### Experience-based, not perception-based partner choice
+
+Attaching to whoever looks similar is the homophily assumption SFT was built to derive around, and would reduce RQ2 to adaptive bounded confidence. Instead a non-neighbour is valued by **reward chained through mutual contacts**:
+
+```
+E[r_ij] = mean over m in N(i) ∩ N(j) of  mean_reward(i<-m) * mean_reward(m<-j)
+```
+
+Both factors are already recorded for `select_responder`, so this adds no state and no LLM call. Since reward is a product of graded stances, the chain is ≈ `g_i · g_j · g_m²`: the intermediary only shrinks the estimate (an ambivalent referrer transmits nothing) and never flips its sign. Two negative channels multiply to a positive estimate, so structural balance (Heider) emerges from the reward primitive.
+
+### Sorting is not clustering: isolating reach from scoring
+
+Attribute-based attachment **sorts** agents, but dense community structure comes from **closing triangles**; a sorting-only rule yields assortative but tree-like structure and low modularity whatever the population size, the mechanistic reading of the modularity shortfall reported in recent LLM-ABM work. Because the referral estimate needs a mutual contact, closure is forced by the information channel. `REWIRE_RULE` makes that a controlled comparison:
+
+| Arm | Pool | Scoring | Isolates |
+|---|---|---|---|
+| `"random"` | any non-neighbour | none | churn alone (the null) |
+| `"reward_local"`, `REWIRE_BETA = 0` | 2-hop | none | **reach alone** |
+| `"reward_local"`, `REWIRE_BETA > 0` | 2-hop | referral | reach plus selection |
+
+The contrast `"random"` vs `"reward_local"` at `REWIRE_BETA = 0` differs only in closure. An empty 2-hop pool returns `None` rather than falling back to a global draw, which would leak exactly the reach the arm withholds.
+
+Primary structural DVs (`analysis/metrics.structure_trace`): `clustering`, `tie_ratio` / `n_inter_edges` and the round it reaches 0, `std_degree` / `assort_degree`. Failure modes to watch: hub collapse at decisive `REWIRE_BETA`; churn before a tie accumulates history; the graph crystallising before Q diverges (the high-`w` end, a result rather than a bug); thin early referral evidence, so early structure should not be over-read.
 
 ---
 
-## Future research: conviction-weighted deliberation
+## Future research
 
-An alternative expression mechanism was designed but dropped in favour of the SFT gate (the full design lived in `PLAN_LLM_bugfix.md`, removed once the gate was implemented; the complete specification survives in that file's git history). Instead of enforcing the softmax-drawn stance, the Q-gap would double as a *prompt authority* signal, `stance_authority = tanh(γ · max(0, softmax_stance × q_gap))`, continuously scaling how assertively the drawn stance is framed in the `respond()` prompt relative to persona and memory. Agents deliberate persona-led at low conviction and become conviction-led as accumulated social feedback grows, producing an organic persona-to-SFT transition arc from a single new parameter γ, with first-attempt fidelity rising monotonically with conviction as its empirical signature. Worth revisiting if a behaviorally richer, non-enforced expression channel becomes a research question in its own right.
+**Continuous, gate-replacing conviction.** The cue is the banded, gate-compatible version of a dropped design in which `tanh(γ · max(0, stance × q_gap))` scaled how assertively the drawn stance was framed *instead of* enforcing it, giving a persona-to-SFT transition from one parameter γ. Its signature, first-attempt fidelity rising with conviction, is readable from cued runs now (`load_gate()` carries `cue` beside `first_expressed`).
 
-A separate design note, `PLAN_weight_level_rl.md`, works out whether the social-feedback signal could learn *inside the LLM's parameters* rather than in the external Q-layer. It rejects the pure RLHF-from-social-feedback version (it would dissolve the scalar Q-state the interpretability check depends on, break the Banisch correspondence, and be sample-hungry and unsweepable) and instead specifies a middle ground: periodic, offline, per-agent LoRA distillation seeded from the same `reward_from_expressions()` signal, where the Q-layer stays the sole seat of opinion and the adapter is a pure expression/entrenchment layer. Gated behind a default-off `ADAPTER_DISTILL_ENABLED`, so the canonical experiment is unaffected.
+**Weight-level social-feedback learning.** [`PLAN_weight_level_rl.md`](PLAN_weight_level_rl.md) rejects RLHF from social feedback as the main mechanism (it would dissolve the Q-state the interpretability claim rests on) and sketches periodic per-agent LoRA distillation from the same reward, with Q remaining the sole seat of opinion. Not implemented.
 
 ---
 
@@ -659,8 +557,10 @@ A separate design note, `PLAN_weight_level_rl.md`, works out whether the social-
 
 Banisch, S., & Olbrich, E. (2019). Opinion polarization by learning from social feedback. *The Journal of Mathematical Sociology, 43*(2), 76-103.
 
+Chuang, Y.-S., et al. (2024). Simulating opinion dynamics with networks of LLM-based agents. *Findings of NAACL 2024*.
+
 Jacob, D., & Banisch, S. (2023). Polarization in social media: A virtual worlds-based approach. *Journal of Artificial Societies and Social Simulation, 26*(3), 11.
 
-Sárközi, R., Denz, T., & Lorenz-Spreen, P. (2022). Testing social feedback theory: An experiment on the effect of social feedback on opinion expression. *PLOS ONE, 17*(4).
-
 Park, J. S., O'Brien, J. C., Cai, C. J., Morris, M. R., Liang, P., & Bernstein, M. S. (2023). Generative agents: Interactive simulacra of human behavior. *UIST 2023*.
+
+Sarközi, M., Jütersonke, S., Banisch, S., Poppe, S., & Berger, R. (2022). The effects of social feedback on private opinions. Empirical evidence from the laboratory. *PLOS ONE, 17*(10), e0274903.

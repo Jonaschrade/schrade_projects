@@ -1,69 +1,30 @@
 """
-Entry point: pairwise simulation mode.
-
-Runs the same SFT mechanisms as network mode for exactly two agents on a
-single-edge graph. Each round is INTERACTIONS_PER_ROUND asymmetric interactions,
-expresser drawn uniformly. Full mechanism and the network/pairwise differences
-are in the README ("Pairwise mode").
-
-Mechanisms present
-------------------
-- SFT Q-values with a softmax stance draw each interaction.
-- Expression gate on every turn (Agent.respond, Step B).
-- Asymmetric update: update_q_value() on the expresser only, indexed on
-  gate_final_expressed_a.
-- Reward consequences (Q-update, reward record, edge dynamics) fire only on a
-  usable signal (clear stance AND scorable reward) and freeze together on a
-  no-signal round (abstention or unparseable reward).
-- Responder selection runs every interaction for mechanism parity, though it
-  always degenerates to the only other agent (RESPONDER_SELECTION_BETA has no
-  effect with two agents).
-- Edge valuation (GRAPH_DYNAMIC = True): update_edge() may sever the single edge;
-  with no other partner to reconnect to, the run ends early. A no-signal round
-  cannot sever the edge.
-- Reflection every REFLECT_EVERY rounds.
-
-Round structure
----------------
-For each round (INTERACTIONS_PER_ROUND interactions; expresser drawn uniformly):
-    1. Draw responder  select_responder(β_sel), degenerates to the other agent
-    2. Softmax draw    softmax(β) over expresser's Q-values
-    3. Exchange        expresser speaks → responder reacts (1 exchange, both gated)
-    4. Reward          reward_a = graded(expresser) × graded(responder) from gates
-    5. Q-update        Q(stance) ← (1−α)·Q(stance) + α·reward_a  [expresser only;
-                       stance = gate_final_expressed_a]
-    6. Reward record   record_reward(reward_a)
-    7. Edge update     update_edge()  [GRAPH_DYNAMIC only]; may sever the edge
-                       and end the run
-    (steps 5-7 fire only on a measured-reward round; frozen together on
-     abstention or a None reward)
-  After all interactions:
-    8. Reflection      if round % REFLECT_EVERY == 0
-
-All tunable parameters live in ``config.py``.
+Pairwise entry point: network mode's mechanism for two agents on one edge
+(README "Pairwise mode"). Responder selection degenerates to the other agent; a
+severance under GRAPH_DYNAMIC ends the run, since there is nobody to rewire to.
 """
 
 import random
-from collections import deque
 
 import networkx as nx
 from langchain_ollama import OllamaLLM
 
-from agents.agent import Agent
+from agents.agent import Agent, draw_opener
 from agents.personas import sample_personas
 from config import (
+    CONVICTION_CUE_ENABLED,
     GRAPH_DYNAMIC,
     LEARNING_RATE,
     LLM_MODEL,
     LLM_NUM_CTX,
+    MEMORY_ENABLED,
     NETWORK_MAX_ROUNDS,
     OLLAMA_HOST,
     OPINION_BETA,
     REFLECT_EVERY,
     RESPONDER_SELECTION_BETA,
-    REWARD_WINDOW_M,
+    INITIAL_EDGE_STRENGTH,
     TOPIC_LABEL,
-    TOPIC_TEXT,
 )
 from network.discussion import gate_summary, run_discussion
 from network.edges import record_reward, update_edge
@@ -71,14 +32,14 @@ from network.logger import SimulationLogger
 from network.matching import select_responder
 from network.opinion import (
     compute_polarization_metrics,
+    conviction_cue,
     draw_softmax_stance,
     init_opinion_states,
     update_q_value,
 )
-from network.state import EdgeData, NetworkState
+from network.state import NetworkState, new_edge_data
 
-# Pairwise mode fixes this locally at 2 (one expected interaction per role
-# direction per round); config.INTERACTIONS_PER_ROUND applies to network mode only.
+# One expected interaction per agent per round; config's value is network-mode only.
 INTERACTIONS_PER_ROUND = 2
 
 
@@ -100,8 +61,10 @@ def main() -> None:
     print("Participants")
     for name, agent in agents.items():
         print(f"\n\n  {name}: {agent.persona}")
-        print(f"\n     Pro-Stance-Bridge:    {agent._stance_bridges[1]}")
-        print(f"\n     Contra-Stance-Bridge: {agent._stance_bridges[-1]}")
+        # Bridges exist only with STANCE_BRIDGE_ENABLED; stdout is their only record.
+        for s, label in ((1, "Pro"), (-1, "Contra")):
+            if s in agent._stance_bridges:
+                print(f"\n     {label}-Stance-Bridge: {agent._stance_bridges[s]}")
     print(f"\n{'━' * 50}\n")
 
     logger.log_personas(agents)
@@ -112,13 +75,7 @@ def main() -> None:
     # -- Single-edge graph (identical EdgeData to network mode) -----------
     G = nx.Graph()
     G.add_nodes_from([a_name, b_name])
-    G.add_edge(a_name, b_name, data=EdgeData(
-        strengths={a_name: 1.0, b_name: 1.0},
-        reward_history={
-            a_name: deque(maxlen=REWARD_WINDOW_M),
-            b_name: deque(maxlen=REWARD_WINDOW_M),
-        },
-    ))
+    G.add_edge(a_name, b_name, data=new_edge_data(a_name, b_name, INITIAL_EDGE_STRENGTH))
     state = NetworkState(agents=agents, graph=G, max_rounds=NETWORK_MAX_ROUNDS)
     state.opinion_states = opinion_states
 
@@ -163,6 +120,10 @@ def main() -> None:
             # 2. Softmax draw
             softmax_a = draw_softmax_stance(opinion_states[expresser_name], OPINION_BETA)
             softmax_b = draw_softmax_stance(opinion_states[responder_name], OPINION_BETA)
+            cue_a = (conviction_cue(opinion_states[expresser_name], softmax_a)
+                     if CONVICTION_CUE_ENABLED else None)
+            cue_b = (conviction_cue(opinion_states[responder_name], softmax_b)
+                     if CONVICTION_CUE_ENABLED else None)
 
             print(
                 f"\n  [{interaction_i + 1}/{INTERACTIONS_PER_ROUND}]  "
@@ -174,11 +135,13 @@ def main() -> None:
             result = run_discussion(
                 agents[expresser_name],
                 agents[responder_name],
-                TOPIC_TEXT,
+                draw_opener()[0],   # per exchange, not fixed
                 topic_label=TOPIC_LABEL,
                 turns_per_agent=1,
                 softmax_a=softmax_a,
                 softmax_b=softmax_b,
+                cue_a=cue_a,
+                cue_b=cue_b,
                 prior_b_message=last_message_to.get((responder_name, expresser_name)),
             )
 
@@ -190,14 +153,7 @@ def main() -> None:
             result["argmax_b"] = opinion_states[responder_name].argmax_stance
             logger.log_discussion(round_n, expresser_name, responder_name, result)
 
-            # 5-7. Reward consequences (expresser only): Q-update, edge reward
-            #    record, and edge-strength dynamics all fire iff the round
-            #    produced a usable signal (clear stance AND measured reward).
-            #    Two no-signal cases freeze all three, logged distinctly but
-            #    with identical effect:
-            #      - abstention: ambiguous expression (gate_final_expressed_a == 0);
-            #      - unparseable reward (reward_a is None): fabricating r = 0 would
-            #        falsely decay Q and drift the edge. See README "Two reward signals".
+            # 5-7. Reward consequences only on a measured-reward round (see main_network).
             expressed_a = result["gate_final_expressed_a"]
             abstained = expressed_a == 0
             apply_reward = not abstained and result["reward_a"] is not None
@@ -229,26 +185,24 @@ def main() -> None:
                 f"    Updated Q-gap {expresser_name}: {q.q_gap:+.3f} ({idx_note})"
             )
 
-            # Reward record + edge dynamics: only on a measured-reward round.
             if apply_reward:
-                # Record reward on this edge; feeds future responder draws.
                 record_reward(
                     state,
                     expresser_name,
                     responder_name,
                     reward_a=result["reward_a"],
-                    # reward_b=result["reward_b"],  # enable for symmetric mode
                 )
 
                 # Edge update (GRAPH_DYNAMIC only): may sever the edge
                 if GRAPH_DYNAMIC:
-                    survived = update_edge(state, expresser_name, responder_name)
+                    severed_by = update_edge(state, expresser_name, responder_name)
                     print(
                         f"    Strength  {expresser_name}: {edge_data.strengths[expresser_name]:.2f}  "
                         f"│  {responder_name}: {edge_data.strengths[responder_name]:.2f}"
                     )
-                    if not survived:
-                        print("\n  ✋ Conversation ended: relationship strength reached floor.")
+                    if severed_by is not None:
+                        print(f"\n  ✋ Conversation ended: {severed_by} let relationship "
+                              f"strength reach floor.")
                         terminated_early = True
                         break
 
@@ -256,10 +210,15 @@ def main() -> None:
             break
 
         # -- Reflection phase ---------------------------------------------
-        if round_n % REFLECT_EVERY == 0:
+        if MEMORY_ENABLED and round_n % REFLECT_EVERY == 0:
             print(f"\n-- Reflection phase (round {round_n}) --")
             for agent in agents.values():
-                agent.reflect(opinion_states[agent.name].argmax_stance)
+                agent.reflect(
+                    opinion_states[agent.name].argmax_stance,
+                    conviction_cue(opinion_states[agent.name],
+                                   opinion_states[agent.name].argmax_stance)
+                    if CONVICTION_CUE_ENABLED else None,
+                )
                 logger.log_reflection(round_n, agent.name)
 
     # -- Summary ----------------------------------------------------------

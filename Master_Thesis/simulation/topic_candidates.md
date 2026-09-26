@@ -1,200 +1,81 @@
 # Candidate discussion topics
 
-Alternatives to the current immigration topic (`config.py` → `TOPIC_LABEL` / `TOPIC_TEXT`),
-collected after the 2026-07-03 β=0 harvest located a strong directional prior in the
-*generation* channel for the restrictive-immigration wording (contra-restriction fidelity 43%
-vs. pro-restriction 84%, p < 10⁻⁸; see `test_schedule.md` § "Topic wording"). This failure
-mode is documented in the literature: LLM debate agents systematically drift from their
-assigned persona toward the model's inherent stance (Taubenfeld et al. 2024), and networked
-LLM-agent simulations converge toward the model's prior rather than the seeded opinion
-distribution (Chuang et al. 2024). If Stage 1 is to run on a (near-)symmetric topic rather
-than under a measured persona field, one of the candidates below replaces the immigration
-wording. Whichever topic is chosen, the prior is **measured, not assumed**; see the
-selection procedure at the end.
+Why `config.TOPICS` holds the three dichotomies it does, and what the alternatives were. The default is **`nuclear`**.
+
+The earlier default, restrictive immigration, carried a directional prior in the *generation* channel: drafts anchored against the model's lean held that stance markedly less often. (That harvest is not in the committed logs, so no figures are given.) The failure mode is documented: LLM debate agents drift toward the model's own stance (Taubenfeld et al. 2024), and networked LLM agents converge toward the model's prior (Chuang et al. 2024). Whatever the topic, the prior is **measured, not assumed** (§ Validation).
 
 ## Selection criteria
 
-A topic must satisfy all five; they are ordered by how expensive a violation is to repair.
+All five must hold; they are ordered by how expensive a violation is to repair.
 
-1. **Crisp binary endorsement.** The proposition must map cleanly onto the ±1 stance
-   dimension (`config.py` § "Discussion topic"): a single opinion object, endorse/reject,
-   stable semantic interpretation across all rounds. Propositions with graded or
-   multi-dimensional answers ("how much", "under which conditions") blur the Q-value
-   semantics.
-2. **Low latent valence (directional prior).** The LLM must not carry a strong
-   RLHF-instilled lean toward one stance. A left-libertarian lean is consistently
-   documented across model families and instruments (Santurkar et al. 2023; Hartmann et
-   al. 2023; Feng et al. 2023; Motoki et al. 2024; Rozado 2024) and is strongest on
-   culture-war identity topics (immigration, guns, abortion); it is weakest where **both
-   stances have socially-desirable framings**, so the model has no single "safe" answer to
-   converge on. Note also that forced-choice survey instruments overstate the stability of
-   these leans, measured stances shift with framing and context (Röttger et al. 2024a),
-   which is a further argument for measuring the prior *in the simulation's own generation
-   setting* rather than importing a political-compass score. The pilot showed the prior
-   lives mainly in the *generation* channel (persona fidelity asymmetry), not the reward
-   channel, so argument quality and confidence must be comparable on both sides, or the
-   asymmetry re-enters as a polarization confound no reward-classifier fix can remove.
-3. **Guardrail-safe.** Neither stance may trigger safety hedging ("this is a complex issue
-   affecting real people…"). Exaggerated safety behaviour, refusing or hedging on benign
-   prompts that lexically resemble unsafe ones, is a documented, systematic LLM failure
-   mode (Röttger et al. 2024b). Hedging is asymmetric, it attaches to one stance, and
-   breaks symmetry at *generation*, upstream of every mechanism the thesis studies. The
-   pilot's harsher asylum wording tripped exactly this. Rule of thumb: policy questions
-   about *systems* (energy, work, transport, voting) are safe; questions about *groups of
-   people* are not.
-4. **Sufficient affective charge.** Agents need substantive, genuinely contested material
-   for conviction dynamics. A perfectly neutral but bland topic (daylight saving time)
-   buys valence symmetry at the cost of nothing to polarize over.
-5. **Flippable wording (Stage 5 control).** A natural mirrored proposition must exist
-   (cf. restrictive/permissive immigration pair), so the stance-flip control can test
-   whether dynamics follow the wording or the mechanism.
+1. **Crisp binary.** One opinion object on the ±1 dimension, stable across rounds. "How much" or "under which conditions" answers blur the Q-value semantics.
+2. **Low latent valence.** A left-libertarian lean is documented across model families and instruments (Santurkar et al. 2023; Hartmann et al. 2023; Feng et al. 2023; Motoki et al. 2024; Rozado 2024), strongest on identity topics and weakest where **both stances have socially desirable framings**. Survey-style measurements overstate its stability (Röttger et al. 2024a), which is another reason to measure it in the simulation's own setting. Argument quality must be comparable on both sides, or the asymmetry re-enters as a polarization confound.
+3. **Guardrail-safe.** Safety hedging on benign-looking prompts is systematic (Röttger et al. 2024b) and attaches to one stance, breaking symmetry at generation. Rule of thumb: questions about *systems* (energy, work, transport) are safe; questions about *groups of people* are not.
+4. **Sufficient charge.** Agents need contested substance to build conviction. A bland topic buys symmetry at the cost of nothing to polarize over, and agreeable filler (sycophancy; Sharma et al. 2024) masquerades as convergence.
+5. **Flippable as a pairwise comparison.** The −1 pole reverses the +1 pole's comparison, so both are positive statements of equal breadth, no status quo sits between them, and the stance-flip control (Stage 3) introduces no negation.
 
-## Tier 1, recommended
+## The default: nuclear power, good against harm
 
-### Nuclear power expansion
+- **+1:** *"Nuclear power does more good than harm."* **−1:** *"Nuclear power does more harm than good."* **Opener:** *"Does nuclear power do more good than harm, or more harm than good?"* (and the swapped order).
+- **Binary:** one object, compared with itself rather than with another energy source; the only position on neither pole, a tie, carries no lean.
+- **Valence:** both poles have progressive *and* conservative framings (decarbonisation, energy independence, baseload vs. waste, accidents, cost overruns, proliferation), with real-world anchors on both sides (France vs. Germany's *Atomausstieg*). A mild pro-nuclear lean is possible, since US support for expansion rose from 43 % (2020) to ~59 % (2025) across both parties (Pew Research Center 2025), while Hartmann et al.'s pro-environmental finding cuts the other way. The audit decides.
+- **Guardrails:** none; energy policy, not people. **Charge:** high, with decades of live conflict.
+- **Flip:** three earlier wordings failed. *Essential* / *too dangerous* never contradicted each other, so the swapped frame asked the rater for an inference. *A larger* / *a smaller role* were contraries: defending the current share sat on neither pole and was the easiest anchored argument. A plain negation closes that gap but puts a negation into every Stage 3 classifier call and stance sentence. Good against harm avoids all three.
 
-- **Default wording:** *"The United States should significantly expand nuclear power to meet
-  its electricity demand."*
-- **Flipped wording (Stage 5):** *"The United States should phase out nuclear power in favor
-  of other energy sources."*
-- **Binary (1):** clean, expand vs. don't expand, one opinion object.
-- **Valence (2):** the key advantage. Both stances have progressive *and* conservative
-  framings, pro: decarbonization, climate urgency, energy independence, baseload
-  reliability; contra: waste, catastrophic risk, cost overruns, renewables-first. No single
-  socially-desirable answer, so argument quality and confidence come out comparable on both
-  sides. Real-world anchor points exist for both poles (France's fleet vs. Germany's
-  Atomausstieg). *Caveat:* recent models may carry a **mild pro-nuclear lean**, US public
-  support for expanding nuclear power rose from 43% (2020) to ~59% (2025), with majorities
-  in both parties (Pew Research Center 2025), and training data will reflect that discourse
-  shift, much weaker and less consistent than the immigration prior, but not guaranteed
-  zero; the audit decides. (Hartmann et al. 2023's "pro-environmental" ChatGPT finding cuts
-  the *other* way for nuclear, which is itself evidence the framings compete.)
-- **Guardrails (3):** zero friction, energy policy, not people.
-- **Charge (4):** high, genuinely contested with real stakes; decades of live political
-  conflict to draw arguments from.
-- **Flip (5):** natural expand/phase-out pair.
+## Registered dichotomies (`config.TOPICS`)
 
-## Tier 2, viable runner-ups
+All three share the pairwise form and an opener naming both objects, drawn per exchange in either order. They span one axis, how polarized the topic is outside the simulation; the two alternates are Stage 5's arms ([`../analysis/final_schedule.md`](../analysis/final_schedule.md) § Bracket C).
 
-### Universal Basic Income
+| Key | +1 pole | −1 pole | Why |
+|---|---|---|---|
+| `nuclear` | nuclear power does more good than harm | more harm than good | the default: contested but cross-cutting |
+| `renewables` | renewables should be prioritized over fossil fuels | fossil fuels over renewables | Stage 5, `5-01`…`5-03`: the **polarized** energy topic, mapping onto the partisan divide and where the model's own lean is expected to be strongest (criterion 2; cf. Hartmann et al. 2023) |
+| `coffee_tea` | coffee is better than tea | tea is better than coffee | Stage 5, `5-04`…`5-06`: the **barely polarized** control, failing criterion 4 on purpose, to separate what the feedback mechanism produces from what a topic brings |
 
-- **Default:** *"The United States should introduce a universal basic income for all
-  adults."* / **Flipped:** *"…should reject proposals for a universal basic income."*
-- **Binary (1):** weakest point, "introduce" invites hedged intermediate positions (pilot
-  programs, partial schemes) that muddy the ±1 endorsement.
-- **Valence (2):** well-balanced argument space (automation-proofing, poverty floor,
-  bureaucracy reduction vs. cost, inflation, work incentives); cross-cutting support
-  (libertarian *and* left variants) mutes a uniform prior. Possible mild left lean.
-- **Guardrails (3):** none. **Charge (4):** high. **Flip (5):** workable but the negation
-  is rhetorically weaker than a true mirror.
+The same comparison in both directions keeps the audit's frame test clean: a text preferring either object supports exactly one pole, so a rater reading the text must mirror its label when the order is swapped. No proposition names a country, since personas are US records and ground their own arguments; `renewables` therefore reads as a global claim, which may strengthen the model's lean, and the audit measures that.
 
-### Mandated four-day work week
+## Runner-ups (not registered)
 
-- **Default:** *"The United States should mandate a four-day work week by law."* /
-  **Flipped:** *"…should leave the length of the work week entirely to employers."*
-- **Binary (1):** crisp, the "by law" clause forces the divisive question (mandate vs.
-  market) rather than the anodyne one (is leisure nice).
-- **Valence (2):** mild left/labor lean expected; the mandate framing pulls in genuine
-  contra material (small-business burden, wage effects, sectoral impossibility).
-- **Guardrails (3):** none. **Charge (4):** medium-high, personally relatable to any
-  persona. **Flip (5):** good natural mirror.
+Each would need rephrasing as a pairwise comparison (criterion 5) before use.
 
-### Compulsory voting
+| Topic | Strength | Weakness |
+|---|---|---|
+| Universal basic income | balanced, cross-cutting argument space | "introduce" invites hedged intermediate positions; possible left lean |
+| Mandated four-day week | "by law" forces the divisive question; relatable to any persona | mild labour lean |
+| Compulsory voting | probably the lowest prior: participation vs. liberty, both desirable | charge medium at best |
+| Urban congestion pricing | clean trade-off structure, live (NYC 2024-25) | technocratic; low charge unless personas are urban |
 
-- **Default:** *"The United States should make voting in federal elections compulsory."* /
-  **Flipped:** *"…should keep voting in federal elections strictly voluntary."*
-- **Binary (1):** crisp. **Valence (2):** genuinely low, democratic-participation framing
-  (pro) vs. individual-liberty framing (contra) are *both* socially desirable; real-world
-  anchors on both sides (Australia/Belgium vs. US/Germany). Probably the lowest-prior
-  candidate on the list.
-- **Guardrails (3):** none. **Charge (4):** the risk, medium at best; less
-  emotionally loaded than nuclear or work-week, conviction dynamics may run shallow.
-  **Flip (5):** excellent natural mirror.
-
-### Urban congestion pricing
-
-- **Default:** *"Large American cities should charge drivers a fee to enter their city
-  centers."* / **Flipped:** *"…should keep city-center access free for all drivers."*
-- **Binary (1):** crisp. **Valence (2):** low, clean trade-off structure (traffic, air
-  quality, transit funding vs. regressive cost, commuter burden); live and genuinely
-  divisive (NYC 2024-25). **Guardrails (3):** none. **Charge (4):** the weakness,
-  medium-low unless personas are urban; may be too technocratic to sustain 25 rounds of
-  conviction accumulation. **Flip (5):** good.
-
-## Rejected (with reasons)
+## Rejected
 
 | Topic | Failing criterion |
 |---|---|
-| Illegal immigration (current) | (2)+(3): measured generation-channel prior (43/84 fidelity split); harsher wordings trip guardrails. Retained in `config.py` only under the "measured persona field" reading of Stage 1. |
-| Abortion, gun control, death penalty | (2)+(3): strongest documented RLHF priors *and* highest hedging risk, the worst quadrant. |
-| GM food, vaccine mandates | (2): strong pro-science prior; contra stance generated with visibly lower confidence. |
-| Zoo bans, animal testing | (2): animal-welfare prior; contra stance drifts toward concession. |
-| Daylight saving time, homework abolition | (4): valence-symmetric but bland, nothing to polarize over. |
-| Congressional term limits | (2)/(4): lopsided real-world agreement (~80% support), the contra stance has no stable social base to roleplay, so drift mimics the immigration failure mode. |
-| AI regulation | (3): self-referential for an LLM; hedging and meta-commentary risk at generation. |
+| Illegal immigration (former default) | (2)+(3): measured generation-channel prior; harsher wordings trip guardrails |
+| Abortion, gun control, death penalty | (2)+(3): strongest priors and highest hedging risk |
+| GM food, vaccine mandates | (2): strong pro-science prior |
+| Zoo bans, animal testing | (2): animal-welfare prior |
+| Daylight saving time, homework abolition | (4): symmetric but bland |
+| Congressional term limits | (2)/(4): ~80 % agreement, no social base for the contra side |
+| AI regulation | (3): self-referential for an LLM |
 
-## Selection procedure (measure, don't assume)
+## Validation
 
-The infrastructure to decide empirically already exists; run it over the shortlist instead
-of trusting intuition (mine included):
+A wording's prior is measured, not argued:
 
-1. **Wire the wording** via the `SIM_TOPIC_TEXT` / `SIM_TOPIC_LABEL` env-var override
-   (`test_schedule.md` § "Required infrastructure changes").
-2. **Reward channel:** the `audit_reward.py` reward-symmetry harness has been retired (see
-   `test_schedule.md` Stage 0b); if the reward channel needs re-auditing under a candidate
-   wording, re-add a small log-mining reward-by-dyad check.
-3. **Generation channel (the decisive test):** run a β=0 harvest with the gate enabled, then
-   `analyze_gate.py`, the per-stance *first-attempt* fidelity split is the direct measurement
-   of the latent prior. Pick the candidate with the smallest |pro − contra| fidelity asymmetry.
-4. **Cross-checks:** early-round expressed-stance split and ER-null consensus-direction
-   tally (standing diagnostics in `test_schedule.md`).
-5. **Confirm charge (criterion 4)** hasn't been traded away: utterances should still show
-   substantive argument, not agreeable filler, spot-check the harvest transcripts.
-   (Agreeable filler is not hypothetical: RLHF-trained assistants exhibit systematic
-   sycophancy, preferring responses that match the interlocutor's view, Sharma et al.
-   2024, which in a deliberation setting masquerades as convergence.)
+1. **Grader side.** The classifier audit ([`../analysis/classifier/`](../analysis/classifier/README.md)) rates one corpus per topic in both answer orders, across all three models; its asymmetry tables and implied dyad cells are the reward-channel test.
+2. **Generator side.** Per-stance first-attempt fidelity from the gate records (`analysis/metrics.persona_field`), and the refusal rate per anchored stance (`unrelated`).
 
-This turns topic choice from a judgment call into a measured design decision, and yields a
-defensible methods-chapter sentence either way: either a near-symmetric topic for the clean
-replication, or a quantified persona field read against both baselines.
+The wording is frozen for the confirmatory schedule ([`../analysis/pre_schedule_report.md`](../analysis/pre_schedule_report.md), Decision 1): an edit invalidates every corpus and label file for that topic.
 
 ## References
 
-- Chuang, Y.-S., Goyal, A., Harlalka, N., Suresh, S., Hawkins, R., Yang, S., Shah, D.,
-  Hu, J., & Rogers, T. T. (2024). Simulating Opinion Dynamics with Networks of LLM-based
-  Agents. *Findings of the Association for Computational Linguistics: NAACL 2024*,
-  3326-3346. <https://aclanthology.org/2024.findings-naacl.211/>
-  (arXiv:[2311.09618](https://arxiv.org/abs/2311.09618))
-- Feng, S., Park, C. Y., Liu, Y., & Tsvetkov, Y. (2023). From Pretraining Data to Language
-  Models to Downstream Tasks: Tracking the Trails of Political Biases Leading to Unfair
-  NLP Models. *Proceedings of ACL 2023*.
-  (arXiv:[2305.08283](https://arxiv.org/abs/2305.08283))
-- Hartmann, J., Schwenzow, J., & Witte, M. (2023). The political ideology of
-  conversational AI: Converging evidence on ChatGPT's pro-environmental, left-libertarian
-  orientation. (arXiv:[2301.01768](https://arxiv.org/abs/2301.01768))
-- Motoki, F., Pinho Neto, V., & Rodrigues, V. (2024). More human than human: measuring
-  ChatGPT political bias. *Public Choice*, 198(1-2), 3-23.
-  <https://doi.org/10.1007/s11127-023-01097-2>
-- Pew Research Center (2025). Support for expanding nuclear power is up in both parties
-  since 2020.
-  <https://www.pewresearch.org/short-reads/2025/10/16/support-for-expanding-nuclear-power-is-up-in-both-parties-since-2020/>
-- Röttger, P., Hofmann, V., Pyatkin, V., Hinck, M., Kirk, H., Schütze, H., & Hovy, D.
-  (2024a). Political Compass or Spinning Arrow? Towards More Meaningful Evaluations for
-  Values and Opinions in Large Language Models. *Proceedings of ACL 2024*, Best Paper
-  Award. <https://aclanthology.org/2024.acl-long.816/>
-  (arXiv:[2402.16786](https://arxiv.org/abs/2402.16786))
-- Röttger, P., Kirk, H., Vidgen, B., Attanasio, G., Bianchi, F., & Hovy, D. (2024b).
-  XSTest: A Test Suite for Identifying Exaggerated Safety Behaviours in Large Language
-  Models. *Proceedings of NAACL 2024*.
-  (arXiv:[2308.01263](https://arxiv.org/abs/2308.01263))
-- Rozado, D. (2024). The political preferences of LLMs. *PLOS ONE*, 19(7), e0306621.
-  <https://doi.org/10.1371/journal.pone.0306621>
-- Santurkar, S., Durmus, E., Ladhak, F., Lee, C., Liang, P., & Hashimoto, T. (2023). Whose
-  Opinions Do Language Models Reflect? *Proceedings of ICML 2023*.
-  (arXiv:[2303.17548](https://arxiv.org/abs/2303.17548))
-- Sharma, M., Tong, M., Korbak, T., Duvenaud, D., Askell, A., Bowman, S. R., et al.
-  (2024). Towards Understanding Sycophancy in Language Models. *ICLR 2024*.
-  (arXiv:[2310.13548](https://arxiv.org/abs/2310.13548))
-- Taubenfeld, A., Dover, Y., Reichart, R., & Goldstein, A. (2024). Systematic Biases in
-  LLM Simulations of Debates. *Proceedings of EMNLP 2024*.
-  (arXiv:[2402.04049](https://arxiv.org/abs/2402.04049))
+- Chuang, Y.-S., Goyal, A., Harlalka, N., Suresh, S., Hawkins, R., Yang, S., Shah, D., Hu, J., & Rogers, T. T. (2024). Simulating Opinion Dynamics with Networks of LLM-based Agents. *Findings of NAACL 2024*, 3326-3346. <https://aclanthology.org/2024.findings-naacl.211/>
+- Feng, S., Park, C. Y., Liu, Y., & Tsvetkov, Y. (2023). From Pretraining Data to Language Models to Downstream Tasks: Tracking the Trails of Political Biases Leading to Unfair NLP Models. *ACL 2023*. (arXiv:[2305.08283](https://arxiv.org/abs/2305.08283))
+- Hartmann, J., Schwenzow, J., & Witte, M. (2023). The political ideology of conversational AI: Converging evidence on ChatGPT's pro-environmental, left-libertarian orientation. (arXiv:[2301.01768](https://arxiv.org/abs/2301.01768))
+- Motoki, F., Pinho Neto, V., & Rodrigues, V. (2024). More human than human: measuring ChatGPT political bias. *Public Choice*, 198(1-2), 3-23. <https://doi.org/10.1007/s11127-023-01097-2>
+- Pew Research Center (2025). Support for expanding nuclear power is up in both parties since 2020. <https://www.pewresearch.org/short-reads/2025/10/16/support-for-expanding-nuclear-power-is-up-in-both-parties-since-2020/>
+- Röttger, P., Hofmann, V., Pyatkin, V., Hinck, M., Kirk, H., Schütze, H., & Hovy, D. (2024a). Political Compass or Spinning Arrow? Towards More Meaningful Evaluations for Values and Opinions in Large Language Models. *ACL 2024*. <https://aclanthology.org/2024.acl-long.816/>
+- Röttger, P., Kirk, H., Vidgen, B., Attanasio, G., Bianchi, F., & Hovy, D. (2024b). XSTest: A Test Suite for Identifying Exaggerated Safety Behaviours in Large Language Models. *NAACL 2024*. (arXiv:[2308.01263](https://arxiv.org/abs/2308.01263))
+- Rozado, D. (2024). The political preferences of LLMs. *PLOS ONE*, 19(7), e0306621. <https://doi.org/10.1371/journal.pone.0306621>
+- Santurkar, S., Durmus, E., Ladhak, F., Lee, C., Liang, P., & Hashimoto, T. (2023). Whose Opinions Do Language Models Reflect? *ICML 2023*. (arXiv:[2303.17548](https://arxiv.org/abs/2303.17548))
+- Sharma, M., Tong, M., Korbak, T., Duvenaud, D., Askell, A., Bowman, S. R., et al. (2024). Towards Understanding Sycophancy in Language Models. *ICLR 2024*. (arXiv:[2310.13548](https://arxiv.org/abs/2310.13548))
+- Taubenfeld, A., Dover, Y., Reichart, R., & Goldstein, A. (2024). Systematic Biases in LLM Simulations of Debates. *EMNLP 2024*. (arXiv:[2402.04049](https://arxiv.org/abs/2402.04049))

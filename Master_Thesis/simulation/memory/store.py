@@ -1,9 +1,9 @@
 """
-MemoryStore: per-agent ChromaDB-backed memory.
+MemoryStore: one isolated ChromaDB collection per agent.
 
-Each agent gets its own isolated collection so memories never cross between
-agents.  Memories are stored with an embedding, importance score, type tag,
-and Unix timestamp, which the scoring function uses to rank retrieval results.
+MEMORY_ENABLED = False (the ablation arm) makes ``retrieve`` return nothing while
+``add`` keeps writing; reflection, which reads ``all_recent``, is gated by the
+main loops.
 """
 
 import re
@@ -13,28 +13,20 @@ import uuid
 
 import chromadb
 
-from config import MAX_MEMORIES_RETRIEVE, MEMORY_DIR, MEMORY_PERSIST
+from config import MAX_MEMORIES_RETRIEVE, MEMORY_DIR, MEMORY_ENABLED, MEMORY_PERSIST
 from memory.scoring import score_memory
 
-_UMLAUT_MAP = str.maketrans({"ä":"ae","ö":"oe","ü":"ue","Ä":"Ae","Ö":"Oe","Ü":"Ue","ß":"ss"})
 
 def _collection_name(agent_name: str) -> str:
-    name = agent_name.translate(_UMLAUT_MAP)
-    name = unicodedata.normalize("NFKD", name).encode("ascii", "ignore").decode()
+    """ChromaDB-safe collection name for an agent."""
+    name = unicodedata.normalize("NFKD", agent_name).encode("ascii", "ignore").decode()
     name = re.sub(r"[^a-zA-Z0-9._-]", "_", name).strip("._-") or "agent"
     return f"mem_{name}"
 
 
 class MemoryStore:
     def __init__(self, agent_name: str, persist: bool = MEMORY_PERSIST):
-        """Create or reopen a ChromaDB collection for agent_name.
-
-        Args:
-            agent_name: Used as the collection name prefix to keep agent
-                        memories isolated from each other.
-            persist:    If True, data is written to MEMORY_DIR on disk;
-                        otherwise an in-memory ephemeral client is used.
-        """
+        """Create or reopen agent_name's collection, on disk (MEMORY_DIR) if persist."""
         if persist:
             client = chromadb.PersistentClient(path=MEMORY_DIR)
         else:
@@ -51,18 +43,12 @@ class MemoryStore:
         embedding: list,
         stance: int = 0,
     ) -> None:
-        """Persist a single memory with its metadata.
+        """Store one memory.
 
         Args:
-            content:    The memory text (interaction summary or reflection insight).
-            mem_type:   'interaction' or 'reflection'. ('persona' is reserved
-                        but currently unused: persona seeding at init is
-                        disabled, see Agent.__init__.)
-            importance: LLM-rated significance on a 1-10 scale.
-            embedding:  Pre-computed vector embedding of content.
-            stance:     Stance this memory was formed under: +1, −1, or 0
-                        (neutral/unknown, e.g. ambiguous classification). Used at
-                        retrieval time to bias toward stance-congruent memories.
+            mem_type:   'interaction' or 'reflection'.
+            importance: LLM-rated significance, 1-10.
+            stance:     +1, -1, or 0 (neutral); biases later retrieval.
         """
         self.col.add(
             documents  = [content],
@@ -84,26 +70,15 @@ class MemoryStore:
         n: int = MAX_MEMORIES_RETRIEVE,
         query_stance: int | None = None,
     ) -> list[dict]:
-        """Return the top-n memories by composite score against query_embedding.
+        """Top-n memories by composite score (memory/scoring.py) over the whole collection.
 
-        The full collection is scored by a composite of relevance (to
-        query_embedding), recency, importance, and (when query_stance is given)
-        stance congruence, then cut down to n. This lets a highly important or
-        very recent memory surface even if it isn't among the closest by
-        embedding distance alone.
-
-        Args:
-            query_embedding: Embedding of the current message or question.
-            n:               Maximum number of memories to return.
-            query_stance:    The retrieving agent's current softmax-drawn
-                             stance (+1 or −1), or None to leave retrieval
-                             stance-unbiased.
+        ``query_stance`` biases toward congruent memories; None leaves retrieval
+        stance-unbiased. Empty when MEMORY_ENABLED is False.
 
         Returns:
-            List of {"content": str, "type": str, "score": float} dicts,
-            sorted by descending composite score, truncated to n.
+            [{"content", "type", "score"}], best first.
         """
-        if self.col.count() == 0:
+        if not MEMORY_ENABLED or self.col.count() == 0:
             return []
 
         results = self.col.query(
@@ -128,16 +103,10 @@ class MemoryStore:
         return sorted(scored, key=lambda x: x["score"], reverse=True)[:n]
 
     def all_recent(self, limit: int) -> list[str]:
-        """Return the limit most recently added memory strings.
-
-        Used to seed the reflection step, where recency matters more than
-        relevance to a specific query.
-        """
+        """The ``limit`` most recent memories, for seeding reflection."""
         if self.col.count() == 0:
             return []
-        # Fetch all records with timestamps, then sort by recency.
-        # col.get(limit=n) returns records in ChromaDB's internal ID order,
-        # which is not guaranteed to match insertion/chronological order.
+        # Sorted by timestamp: col.get(limit=n) follows ID order, not insertion order.
         results = self.col.get(include=["documents", "metadatas"])
         pairs = list(zip(results["documents"], results["metadatas"]))
         pairs.sort(key=lambda x: x[1].get("ts", 0.0), reverse=True)

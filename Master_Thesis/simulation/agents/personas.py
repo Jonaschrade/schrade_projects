@@ -1,18 +1,10 @@
 """
-Persona sampling from gss_personas.json.
-
-The JSON file contains survey records for US respondents (General Social
-Survey) as a list of dicts. Each dict maps survey question text to the
-respondent's answer. Immigration-attitude fields and technical classification
-codes have been removed during export (see notebooks/script.ipynb) to prevent
-stance leakage into persona descriptions.
+Persona sampling from data/gss_personas.json: GSS survey records (question text
+-> answer), exported by notebooks/data_processing.ipynb with attitude items
+excluded (README "Persona pool").
 
 Public API:
-    sample_personas(n, llm) -> list[dict]
-        Randomly draws n survey records, derives an American first name and a
-        concise persona description for each via the LLM, and returns
-        a list of {"name": str, "persona": str} dicts ready for Agent
-        construction.
+    sample_personas(n, llm) -> list[{"name", "persona"}]
 """
 
 import json
@@ -30,11 +22,7 @@ def _load_pool() -> list[dict]:
 
 
 def _clean_value(value: str) -> str:
-    """Strip leading numeric answer codes from survey values.
-
-    Survey answers may be prefixed with codes like '(2) ' or '(11) ' that encode
-    the response scale position. These are not meaningful for the LLM prompt.
-    """
+    """Strip leading answer codes such as '(2) '."""
     return re.sub(r"^\(\d+\)\s*", "", value).strip()
 
 
@@ -44,16 +32,7 @@ def _format_record(record: dict) -> str:
 
 
 def _expand(record: dict, llm) -> dict:
-    """Derive a name and persona description from a survey record via the LLM.
-
-    Args:
-        record: A single survey record dict with English question/answer pairs.
-        llm:    An instantiated LangChain LLM.
-
-    Returns:
-        {"name": str, "persona": str}: falls back to generic values if the
-        LLM response cannot be parsed.
-    """
+    """LLM-derived first name and second-person persona for one record; generic fallback if unparseable."""
     attributes = _format_record(record)
 
     raw = llm.invoke(
@@ -83,19 +62,7 @@ def _expand(record: dict, llm) -> dict:
 
 
 def sample_personas(n: int, llm) -> list[dict]:
-    """Sample n personas at random and expand each with the LLM.
-
-    Names are guaranteed to be unique across all sampled agents. If the LLM
-    assigns a name that is already taken, a new record is drawn and expanded
-    until a distinct name is produced.
-
-    Args:
-        n:   Number of personas to sample.
-        llm: An instantiated LangChain LLM used to expand each record.
-
-    Returns:
-        List of n {"name": str, "persona": str} dicts with unique names.
-    """
+    """Draw records at random and expand them until n personas with unique names exist."""
     pool = _load_pool()
     personas = []
     used_names: set[str] = set()

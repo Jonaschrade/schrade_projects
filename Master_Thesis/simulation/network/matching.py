@@ -1,26 +1,30 @@
 """
-Agent partner selection and network reconnection for the network simulation.
+Partner selection and tie formation: one reward primitive at two ranges.
 
-``select_responder`` implements the asymmetric rule's responder draw: given an
-expresser and its neighbours, it draws a responder weighted by the expresser's
-own past reward from each neighbour (per ``EdgeData.reward_history``, populated
-by ``network.edges.record_reward``). β_sel = 0 gives a uniform draw (Banisch &
-Olbrich 2019); β_sel > 0 prefers neighbours with higher expected reward.
+``select_responder`` (1-hop) weights neighbours by the expresser's own past
+reward from them. ``expected_reward_via_referral`` (2-hop) estimates a
+non-neighbour's reward by chaining it through mutual contacts; it drives
+``rewire_after_drop``. No opinion state is read anywhere here: partner choice is
+experience-based, so homophily is not assumed (README "Extension: endogenous tie
+formation").
 
-``compute_pairings`` and ``ensure_connectivity`` are retained for the
-``GRAPH_DYNAMIC = True`` extension (endogenous tie rewiring).
+An isolated agent is never reconnected; it sits out until another agent's rewire
+picks it, which "reward_local" can never do.
 """
 
 from __future__ import annotations
 
 import math
 import random
-from collections import deque
 
 import networkx as nx
 
-from config import REWARD_WINDOW_M
-from network.state import EdgeData, NetworkState
+from config import (
+    NEW_EDGE_STRENGTH,
+    REWIRE_BETA,
+    REWIRE_RULE,
+)
+from network.state import NetworkState, new_edge_data
 
 
 def select_responder(
@@ -29,35 +33,10 @@ def select_responder(
     graph: nx.Graph,
     beta: float,
 ) -> str:
-    """Draw a responder from the expresser's neighbours by expected reward.
+    """Draw a responder with weight exp(β_sel · mean reward the expresser got from it).
 
-    Called once per interaction in the main loops. Each neighbour's expected
-    reward is the mean of the expresser's own reward history on that edge
-    (``EdgeData.reward_history[expresser]``, populated by ``record_reward`` after
-    every measured-reward interaction; no-signal rounds record nothing).
-    Neighbours with no history yet contribute a neutral 0.0 (cold start). Kept
-    standalone so the virtual-worlds multi-platform extension can swap in a
-    different draw without touching the interaction loop.
-
-    Weight formula:  w_j = exp(β_sel · expected_reward(expresser, j))
-
-    Parameters
-    ----------
-    expresser:
-        Name of the agent expressing an opinion this interaction.
-    neighbours:
-        Adjacency list of the expresser (already filtered to non-empty).
-    graph:
-        The network graph; edges carry ``EdgeData`` under ``"data"``.
-    beta:
-        Responder-selection inverse temperature β_sel ≥ 0.
-        β_sel = 0 → uniform draw (Banisch & Olbrich 2019).
-        β_sel > 0 → neighbours with higher expected reward weighted higher.
-
-    Returns
-    -------
-    str
-        Name of the selected responder.
+    β_sel = 0 is uniform (Banisch & Olbrich 2019); an empty history counts as 0.0.
+    Standalone so a multi-platform neighbour set (Jacob & Banisch 2023) can swap in.
     """
     if beta == 0.0:
         return random.choice(neighbours)
@@ -66,104 +45,114 @@ def select_responder(
         history = graph[expresser][neighbour]["data"].reward_history[expresser]
         return sum(history) / len(history) if history else 0.0
 
-    weights = [math.exp(beta * expected_reward(n)) for n in neighbours]
+    return _softmax_choice(neighbours, [expected_reward(n) for n in neighbours], beta)
+
+
+def _softmax_choice(names: list[str], scores: list[float], beta: float) -> str:
+    """Draw one name with probability ∝ exp(β · score); shared by both ranges."""
+    if beta == 0.0:
+        return random.choice(names)
+
+    weights = [math.exp(beta * s) for s in scores]
     total = sum(weights)
     r = random.random() * total
     cumulative = 0.0
-    for name, w in zip(neighbours, weights):
+    for name, w in zip(names, weights):
         cumulative += w
         if r <= cumulative:
             return name
-    return neighbours[-1]
+    return names[-1]
 
 
-def compute_pairings(state: NetworkState) -> list[tuple[str, str]]:
-    """Compute agent pairings for the current round.
+def _mean_history(graph: nx.Graph, holder: str, other: str) -> float | None:
+    """Mean of ``holder``'s reward history on (holder, other); None when empty.
 
-    Not called in the default asymmetric mode. Reserved for the
-    ``GRAPH_DYNAMIC = True`` extension if a symmetric global-matching round
-    structure is needed alongside endogenous tie rewiring.
+    The referral estimate drops an empty channel rather than averaging in a 0.0.
+    """
+    history = graph[holder][other]["data"].reward_history[holder]
+    return sum(history) / len(history) if history else None
 
-    Agents are matched over existing edges by max-weight matching (Edmonds'
-    blossom); unmatched agents pause the round with edge strengths and memories
-    unchanged. If the agent count is odd, one agent is rotated out each round and
-    recorded in ``state.idle_agent``, cycling via ``state.round % len(agents)`` so
-    no agent is systematically excluded.
 
-    Parameters
-    ----------
-    state:
-        The current ``NetworkState``. ``state.idle_agent`` may be mutated.
+def expected_reward_via_referral(
+    state: NetworkState,
+    initiator: str,
+    candidate: str,
+) -> float:
+    """Reward ``initiator`` would expect from non-neighbour ``candidate``.
+
+        Ê[r_ij] = mean over m ∈ N(i) ∩ N(j) of  r̄_im · r̄_mj
+
+    Since reward is a product of graded stances, r̄_im · r̄_mj ≈ g_i · g_j · g_m²:
+    the intermediary only shrinks the estimate, never flips its sign. 0.0 when no
+    mutual contact has history in both channels.
+    """
+    graph = state.graph
+    estimates = []
+
+    for contact in graph.neighbors(initiator):
+        if not graph.has_edge(contact, candidate):
+            continue
+        to_me = _mean_history(graph, initiator, contact)
+        to_them = _mean_history(graph, contact, candidate)
+        if to_me is None or to_them is None:
+            continue
+        estimates.append(to_me * to_them)
+
+    return sum(estimates) / len(estimates) if estimates else 0.0
+
+
+def _candidate_pool(
+    state: NetworkState,
+    initiator: str,
+    dropped_partner: str | None,
+    rule: str,
+) -> list[str]:
+    """Non-neighbours ``initiator`` may attach to under ``rule``, sorted.
+
+    Excludes the dropped partner, so a cut tie cannot re-form in the same step.
+    "reward_local": the 2-hop set only; "random": every non-neighbour.
+    """
+    graph = state.graph
+    excluded = set(graph.neighbors(initiator)) | {initiator}
+    if dropped_partner is not None:
+        excluded.add(dropped_partner)
+
+    if rule == "reward_local":
+        two_hop = {
+            far for near in graph.neighbors(initiator) for far in graph.neighbors(near)
+        }
+        return sorted(two_hop - excluded)
+
+    return sorted(set(state.agents) - excluded)
+
+
+def rewire_after_drop(
+    state: NetworkState,
+    initiator: str,
+    dropped_partner: str,
+) -> str | None:
+    """Replace a severed tie in the same step, so the cut is a relocation.
+
+    Only the initiator rewires: it keeps its degree, so |E| and mean degree are
+    conserved while the degree distribution moves. An empty "reward_local" pool
+    does not fall back to a global draw, which would leak the reach the arm
+    withholds.
 
     Returns
     -------
-    list[tuple[str, str]]
-        ``(agent_a_name, agent_b_name)`` pairs holding a discussion this round.
-        Unmatched agents are omitted.
+    The new partner, or None if the pool was empty (the degree drop stands).
     """
-    # Use a sorted list for deterministic sit-out rotation
-    all_agents = sorted(state.agents.keys())
+    pool = _candidate_pool(state, initiator, dropped_partner, REWIRE_RULE)
+    if not pool:
+        return None
 
-    if len(all_agents) % 2 == 1:
-        sit_out_idx = state.round % len(all_agents)
-        state.idle_agent = all_agents[sit_out_idx]
-        active = [a for a in all_agents if a != state.idle_agent]
+    if REWIRE_RULE == "random":
+        partner = random.choice(pool)
     else:
-        state.idle_agent = None
-        active = all_agents
+        scores = [expected_reward_via_referral(state, initiator, c) for c in pool]
+        partner = _softmax_choice(pool, scores, REWIRE_BETA)
 
-    # Build a helper graph with 'weight' = edge strength for the matching algo
-    H = nx.Graph()
-    H.add_nodes_from(active)
-    subgraph = state.graph.subgraph(active)
-    for u, v in subgraph.edges():
-        H.add_edge(u, v, weight=sum(state.graph[u][v]["data"].strengths.values()))
-
-    matched = nx.max_weight_matching(H, maxcardinality=True)
-    return [tuple(pair) for pair in matched]
-
-
-def reconnect_isolated(state: NetworkState, agent_name: str) -> None:
-    """Connect a degree-zero agent to a uniformly random other agent.
-
-    The new edge is created at ``strength=0.5`` (neutral introductory level)
-    so it does not immediately dominate the matching weight of established
-    relationships.
-
-    Parameters
-    ----------
-    state:
-        The current ``NetworkState``.  ``state.graph`` is mutated in place.
-    agent_name:
-        Name of the agent to reconnect.
-    """
-    candidates = [a for a in state.agents if a != agent_name]
-
-    if not candidates:
-        return
-
-    partner = random.choice(candidates)
-    state.graph.add_edge(agent_name, partner, data=EdgeData(
-        strengths={agent_name: 0.5, partner: 0.5},
-        reward_history={
-            agent_name: deque(maxlen=REWARD_WINDOW_M),
-            partner:     deque(maxlen=REWARD_WINDOW_M),
-        },
-    ))
-
-
-def ensure_connectivity(state: NetworkState) -> None:
-    """Reconnect any agent whose degree has dropped to zero.
-
-    Called once per round after all edge updates.  Iterates over every
-    agent and invokes ``reconnect_isolated`` for those with no remaining
-    edges, ensuring no agent is permanently excluded from future rounds.
-
-    Parameters
-    ----------
-    state:
-        The current ``NetworkState``.  ``state.graph`` may be mutated.
-    """
-    for name in list(state.agents.keys()):
-        if state.graph.degree(name) == 0:
-            reconnect_isolated(state, name)
+    state.graph.add_edge(
+        initiator, partner, data=new_edge_data(initiator, partner, NEW_EDGE_STRENGTH)
+    )
+    return partner

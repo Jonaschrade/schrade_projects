@@ -1,27 +1,17 @@
 """
-Grid-search sweep runner for the network simulation.
+Local grid sweep: one ``main_network.py`` subprocess per ``PARAM_GRID`` combination,
+parameters passed as SIM_* environment variables. On the cluster, run_stage.sh
+replaces it.
 
-Launches ``main_network.py`` once per combination in ``PARAM_GRID``, each as an
-independent subprocess. Parameters pass via the ``SIM_*`` environment variables
-read by ``config.py``, so the grid extends without editing ``config.py`` itself.
-
-Each run gets a tagged log directory under ``logs/`` (via ``SIM_RUN_ID``); the
-full grid is recorded in ``manifest.json`` alongside the sweep, joining results
-back to the parameter combination that produced them.
+Each run logs to ``logs/run_sweep_<ts>_<i>/`` and writes its own params.json; the
+grid goes to ``logs/sweeps/<ts>/manifest.json``. The grid is checked against
+``SUPPORTED_OVERRIDES`` and aborts on any other name, because an unread override
+yields a complete run at the wrong parameters.
 
 Usage
 -----
-    python run_sweep.py                  # run the full grid sequentially
-    python run_sweep.py --workers 3      # run up to 3 combinations in parallel
-    python run_sweep.py --dry-run        # print the grid without running anything
-
-Parallelization
-----------------
-Each grid point is a separate OS process running its own Ollama calls, so
-``--workers > 1`` parallelizes at the process level. No shared Python state
-between runs. The practical limit is Ollama's own concurrency (GPU/CPU
-throughput), not this script. Start with ``--workers 1`` to measure a single
-run's wall-clock time before increasing it.
+    python run_sweep.py --dry-run        # print the grid
+    python run_sweep.py --workers 3      # up to 3 runs in parallel (limit: Ollama's concurrency)
 """
 
 from __future__ import annotations
@@ -40,18 +30,36 @@ from pathlib import Path
 # Each key maps to the SIM_* environment variable read by config.py.
 # Edit these lists to change the sweep; values are cast to str() when set.
 PARAM_GRID: dict[str, list] = {
-    "SIM_SBM_P_INTER": [0.05, 0.1, 0.3],
+    "SIM_SBM_M_INTER": [5, 10, 30],   # cross-edge counts, of 100 possible pairs
     "SIM_RESPONDER_SELECTION_BETA": [0.0, 2.0],
     "SIM_OPINION_BETA": [0.0, 1.0, 2.0, 3.0, 4.0, 5.0],
     "SIM_GRAPH_DYNAMIC": ["0", "1"],
 }
 
-# Pilot-run overrides applied to every combination (kept small for fast sweeps).
-# Remove or adjust once the pipeline is validated.
-COMMON_OVERRIDES: dict[str, str] = {
-    "SIM_NUM_AGENTS": "4",
-    "SIM_NETWORK_MAX_ROUNDS": "3",
-}
+# Applied to every combination. Empty by default.
+COMMON_OVERRIDES: dict[str, str] = {}
+
+# Exactly the SIM_* names config.py reads; keep in step with it. Deliberately
+# absent: NUM_AGENTS and NETWORK_MAX_ROUNDS (config.py docstring).
+SUPPORTED_OVERRIDES: frozenset[str] = frozenset({
+    "SIM_SBM_M_INTER", "SIM_SBM_M_INTRA", "SIM_OPINION_BETA",
+    "SIM_RESPONDER_SELECTION_BETA", "SIM_GRAPH_DYNAMIC", "SIM_REWIRE_RULE",
+    "SIM_REWIRE_BETA", "SIM_REWIRE_TIMESCALE_RATIO", "SIM_MEMORY_ENABLED",
+    "SIM_TOPIC", "SIM_TOPIC_LABEL", "SIM_TOPIC_TEXT", "SIM_TOPIC_TEXT_OPPOSITE",
+    "SIM_LLM_MODEL", "SIM_SEED", "SIM_STRENGTH_CAP", "SIM_REWARD_WINDOW_M",
+    "SIM_NEW_EDGE_STRENGTH", "SIM_CONVICTION_CUE", "SIM_STANCE_BRIDGE",
+})
+
+
+def check_overrides() -> None:
+    """Abort on any SIM_* name config.py does not read."""
+    unknown = sorted((set(PARAM_GRID) | set(COMMON_OVERRIDES)) - SUPPORTED_OVERRIDES)
+    if unknown:
+        raise SystemExit(
+            "config.py does not read: " + ", ".join(unknown)
+            + "\nThese would be exported and ignored. Supported: "
+            + ", ".join(sorted(SUPPORTED_OVERRIDES))
+        )
 
 
 def build_grid() -> list[dict[str, str]]:
@@ -98,8 +106,10 @@ def main() -> None:
     parser.add_argument("--dry-run", action="store_true", help="Print the grid without running anything")
     args = parser.parse_args()
 
+    check_overrides()
     combos = build_grid()
-    print(f"Grid size: {len(combos)} combinations  │  workers={args.workers}")
+    # ASCII only: --dry-run runs on Windows consoles (cp1252).
+    print(f"Grid size: {len(combos)} combinations  |  workers={args.workers}")
     for i, combo in enumerate(combos):
         print(f"  [{i:03d}] {combo}")
 

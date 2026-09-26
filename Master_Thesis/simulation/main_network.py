@@ -1,50 +1,32 @@
 """
-Network simulation entry point.
+Network simulation entry point: SFT opinion dynamics (Banisch & Olbrich 2019) with
+the asymmetric interaction rule (Jacob & Banisch 2023) on a two-block graph.
 
-Asymmetric interaction model (Jacob & Banisch 2023) on a single Stochastic Block
-Model (SBM) graph, with SFT opinion dynamics (Banisch & Olbrich 2019): each agent
-holds Q-values over stances (+1 / −1), draws a softmax stance (inverse temperature
-β), and TD-updates that Q-value each interaction. Two stance quantities are
-tracked per interaction (argmax and softmax); what each draft expressed is
-recorded per turn in the expression gate's record (Agent.respond, Step B). Full
-mechanism in the README.
-
-Interaction rule (asymmetric)
-------------------------------
-  1. Draw one expresser uniformly from agents with at least one neighbour.
-  2. Draw one responder from its neighbours, weighted by the expresser's expected
-     reward per neighbour (β_sel = 0 recovers uniform).
-  3. Draw the expresser's softmax stance by softmax(β).
-  4. One exchange: expresser speaks, responder reacts (both turns gated).
-  5. Reward r = graded(expresser's stance) × graded(reaction) from the gate records.
-  6-7. Reward consequences (expresser only): Q-update, edge reward record, and
-     (GRAPH_DYNAMIC) edge-strength update all fire iff the round produced a usable
-     signal (clear stance AND non-None reward), and freeze together on a no-signal
-     round (abstention or None reward). See README "Two reward signals".
-
-A "round" groups INTERACTIONS_PER_ROUND such events for snapshotting.
-
-Experimental variables
------------------------
-SBM_P_INTER               between-community coupling; sweep for the phase transition
-RESPONDER_SELECTION_BETA  partner-selection bias; 0 = uniform, >0 = reward-weighted
-OPINION_BETA              softmax inverse temperature; β=0 is 50/50, β→∞ is argmax
-
-All tunable parameters live in ``config.py``.
+Per interaction (README "Interaction loop"):
+  1. expresser drawn uniformly from agents with a neighbour;
+  2. responder via select_responder (β_sel);
+  3. softmax stance by softmax(β), and the conviction cue;
+  4. one gated exchange (expresser speaks, responder reacts);
+  5. reward r = graded(expression) × graded(reaction);
+  6-8. Q-update, reward record and (GRAPH_DYNAMIC) edge update, all only on a
+     measured-reward round;
+  9. (GRAPH_DYNAMIC) the severing agent rewires in the same step.
+Reflection every REFLECT_EVERY rounds (MEMORY_ENABLED), then a snapshot.
 """
 
 import os
 import random
 import time
-from collections import deque
 
 import networkx as nx
 from langchain_ollama import OllamaLLM
 
-from agents.agent import Agent
+from agents.agent import Agent, draw_opener
 from agents.personas import sample_personas
 from config import (
+    CONVICTION_CUE_ENABLED,
     GRAPH_DYNAMIC,
+    INITIAL_EDGE_STRENGTH,
     INTERACTIONS_PER_ROUND,
     LEARNING_RATE,
     LLM_MODEL,
@@ -52,31 +34,35 @@ from config import (
     NETWORK_MAX_ROUNDS,
     NUM_AGENTS,
     OLLAMA_HOST,
+    MEMORY_ENABLED,
     OPINION_BETA,
     REFLECT_EVERY,
     RESPONDER_SELECTION_BETA,
-    REWARD_WINDOW_M,
+    REWIRE_BETA,
+    REWIRE_RULE,
+    REWIRE_TIMESCALE_RATIO,
     SBM_NUM_COMMUNITIES,
+    SBM_M_INTER,
+    SBM_M_INTRA,
     SBM_P_INTER,
     SBM_P_INTRA,
-    STRENGTH_CAP,
+    SEED,
     STRENGTH_DELTA,
-    STRENGTH_FLOOR,
     TOPIC_LABEL,
-    TOPIC_TEXT,
 )
 from network.discussion import gate_summary, run_discussion
-from network.edges import record_reward, update_edge
+from network.edges import record_reward, rolling_signal, update_edge
 from network.logger import SimulationLogger
-from network.matching import ensure_connectivity, select_responder
+from network.matching import rewire_after_drop, select_responder
 from network.opinion import (
     compute_polarization_metrics,
+    conviction_cue,
     draw_softmax_stance,
     init_opinion_states,
     opinion_states_to_dict,
     update_q_value,
 )
-from network.state import EdgeData, NetworkState
+from network.state import NetworkState, new_edge_data
 
 
 def _distribute_sizes(n: int, k: int) -> list[int]:
@@ -86,39 +72,38 @@ def _distribute_sizes(n: int, k: int) -> list[int]:
 
 
 def _build_initial_graph(agent_names: list[str]) -> nx.Graph:
-    """Create a Stochastic Block Model graph over the agent name list.
+    """Fixed-edge-count two-block graph: SBM_M_INTRA edges per block, SBM_M_INTER across.
 
-    Nodes are relabelled from integers to agent names.  Community membership
-    is stored as a node attribute ``"community"`` for post-hoc analysis.
-    Every edge is initialised with a fresh ``EdgeData`` instance at strength 1.0.
-
-    ``SBM_P_INTER`` is the primary experimental variable: sweep it to reproduce
-    SFT's polarization-to-consensus phase transition.
+    Nodes carry a "community" attribute; edges start at INITIAL_EDGE_STRENGTH.
+    The within-block layer is drawn first, so one seed gives the same
+    within-block graph at every coupling (final_schedule.md § Seeding);
+    benchmark_sft.build_graph mirrors this order.
     """
     n = len(agent_names)
     sizes = _distribute_sizes(n, SBM_NUM_COMMUNITIES)
-    p_matrix = [
-        [SBM_P_INTRA if i == j else SBM_P_INTER for j in range(SBM_NUM_COMMUNITIES)]
-        for i in range(SBM_NUM_COMMUNITIES)
-    ]
 
-    G_int = nx.stochastic_block_model(sizes, p_matrix)
-    G = nx.relabel_nodes(G_int, {i: agent_names[i] for i in range(n)})
-
+    G = nx.Graph()
+    G.add_nodes_from(agent_names)
     offset = 0
+    blocks: list[list[str]] = []
     for comm_idx, size in enumerate(sizes):
-        for i in range(offset, offset + size):
-            G.nodes[agent_names[i]]["community"] = comm_idx
+        block = agent_names[offset:offset + size]
+        blocks.append(block)
+        for name in block:
+            G.nodes[name]["community"] = comm_idx
         offset += size
 
+    # Pass 1: exactly SBM_M_INTRA edges inside each block.
+    for block in blocks:
+        pairs = [(u, v) for i, u in enumerate(block) for v in block[i + 1:]]
+        G.add_edges_from(random.sample(pairs, SBM_M_INTRA))
+
+    # Pass 2: exactly SBM_M_INTER edges across the two blocks.
+    cross_pairs = [(u, v) for u in blocks[0] for v in blocks[1]]
+    G.add_edges_from(random.sample(cross_pairs, SBM_M_INTER))
+
     for u, v in G.edges():
-        G[u][v]["data"] = EdgeData(
-            strengths={u: 1.0, v: 1.0},
-            reward_history={
-                u: deque(maxlen= REWARD_WINDOW_M),
-                v: deque(maxlen=REWARD_WINDOW_M),
-            },
-        )
+        G[u][v]["data"] = new_edge_data(u, v, INITIAL_EDGE_STRENGTH)
 
     return G
 
@@ -134,6 +119,10 @@ def _count_edge_types(G: nx.Graph) -> tuple[int, int]:
 
 def main() -> None:
     """Run the full network simulation."""
+    # Initial conditions only (persona records, not their texts; topology); config.py "Reproducibility".
+    random.seed(SEED)
+    print(f"Seed: {SEED}")
+
     llm = OllamaLLM(model=LLM_MODEL, base_url=f"http://{OLLAMA_HOST}", reasoning=False, num_ctx=LLM_NUM_CTX)
     logger = SimulationLogger(run_id=os.getenv("SIM_RUN_ID"))
 
@@ -149,8 +138,10 @@ def main() -> None:
     print("Participants")
     for name, agent in agents.items():
         print(f"\n  {name}: {agent.persona}")
-        print(f"      Pro-Stance-Bridge:    {agent._stance_bridges[1]}")
-        print(f"      Contra-Stance-Bridge: {agent._stance_bridges[-1]}")
+        # Bridges exist only with STANCE_BRIDGE_ENABLED; stdout is their only record.
+        for s, label in ((1, "Pro"), (-1, "Contra")):
+            if s in agent._stance_bridges:
+                print(f"      {label}-Stance-Bridge: {agent._stance_bridges[s]}")
     print(f"\n{'━' * 60}\n")
 
     logger.log_personas(agents)
@@ -160,15 +151,23 @@ def main() -> None:
     state = NetworkState(agents=agents, graph=G, max_rounds=NETWORK_MAX_ROUNDS)
     state.opinion_states = init_opinion_states(list(agents.keys()))
 
+    logger.log_params()              # the run's own parameter record
     logger.snapshot_network(state)   # round-0 baseline
 
     community_sizes = _distribute_sizes(NUM_AGENTS, SBM_NUM_COMMUNITIES)
     print(
+        f"Model: {LLM_MODEL}\n"
         f"Initial graph: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges  "
-        f"(SBM: {SBM_NUM_COMMUNITIES} communities {community_sizes}, "
-        f"p_intra={SBM_P_INTRA}, p_inter={SBM_P_INTER})\n"
+        f"(fixed-count block model: {SBM_NUM_COMMUNITIES} communities "
+        f"{community_sizes}, m_intra={SBM_M_INTRA}/block, m_inter={SBM_M_INTER} "
+        f"-> densities {SBM_P_INTRA:.3f} / {SBM_P_INTER:.3f})\n"
         f"α={LEARNING_RATE}  β={OPINION_BETA}  β_sel={RESPONDER_SELECTION_BETA}  "
         f"interactions/round={INTERACTIONS_PER_ROUND}  dynamic={GRAPH_DYNAMIC}\n"
+        + (
+            f"rewire={REWIRE_RULE}  β_rw={REWIRE_BETA}  "
+            f"w={REWIRE_TIMESCALE_RATIO} (→ STRENGTH_DELTA={STRENGTH_DELTA:.3f})\n"
+            if GRAPH_DYNAMIC else ""
+        )
     )
 
     # last message each agent sent to a specific partner, keyed by (speaker, listener)
@@ -213,6 +212,12 @@ def main() -> None:
             softmax_a = draw_softmax_stance(state.opinion_states[expresser_name], OPINION_BETA)
             softmax_b = draw_softmax_stance(state.opinion_states[responder_name], OPINION_BETA)
 
+            # 3b. Conviction cue (None = uncued ablation)
+            cue_a = (conviction_cue(state.opinion_states[expresser_name], softmax_a)
+                     if CONVICTION_CUE_ENABLED else None)
+            cue_b = (conviction_cue(state.opinion_states[responder_name], softmax_b)
+                     if CONVICTION_CUE_ENABLED else None)
+
             print(f"\n  [{interaction_i + 1}/{INTERACTIONS_PER_ROUND}]  "
                   f"{expresser_name} → {responder_name}  "
                   f"(softmax stances: {softmax_a:+d} / {softmax_b:+d})")
@@ -221,11 +226,13 @@ def main() -> None:
             result = run_discussion(
                 agents[expresser_name],
                 agents[responder_name],
-                TOPIC_TEXT,
+                draw_opener()[0],   # per exchange, not fixed
                 topic_label=TOPIC_LABEL,
                 turns_per_agent=1,
                 softmax_a=softmax_a,
                 softmax_b=softmax_b,
+                cue_a=cue_a,
+                cue_b=cue_b,
                 prior_b_message=last_message_to.get((responder_name, expresser_name)),
             )
 
@@ -237,14 +244,9 @@ def main() -> None:
             result["argmax_b"] = state.opinion_states[responder_name].argmax_stance
             logger.log_discussion(round_n, expresser_name, responder_name, result)
 
-            # 5-7. Reward consequences (expresser only): Q-update, edge reward
-            #    record, and edge-strength dynamics all fire iff the round
-            #    produced a usable signal (clear stance AND measured reward).
-            #    Two no-signal cases freeze all three, logged distinctly but
-            #    with identical effect:
-            #      - abstention: ambiguous expression (gate_final_expressed_a == 0);
-            #      - unparseable reward (reward_a is None): fabricating r = 0 would
-            #        falsely decay Q and drift the edge. See README "Two reward signals".
+            # 5-8. Reward consequences fire only on a measured-reward round. An
+            #    abstention (expressed 0) and a None reward both freeze all three;
+            #    a fabricated r = 0 would falsely decay Q (README "Two reward signals").
             expressed_a = result["gate_final_expressed_a"]
             abstained = expressed_a == 0
             apply_reward = not abstained and result["reward_a"] is not None
@@ -277,32 +279,67 @@ def main() -> None:
                 f"    Updated Q-gap {expresser_name}: {q.q_gap:+.3f} ({idx_note})"
             )
 
-            # Reward record + edge dynamics: only on a measured-reward round.
             if apply_reward:
-                # Record reward on this edge; feeds future responder draws.
                 record_reward(
                     state,
                     expresser_name,
                     responder_name,
                     reward_a=result["reward_a"],
-                    # reward_b=result["reward_b"],  # enable for symmetric mode
                 )
 
-                # Edge dynamics (GRAPH_DYNAMIC only)
+                # 8-9. Edge dynamics; a severance is a relocation (|E| conserved).
                 if GRAPH_DYNAMIC and state.graph.has_edge(expresser_name, responder_name):
-                    survived = update_edge(state, expresser_name, responder_name)
-                    event_type = "edge_maintained" if survived else "edge_dropped"
-                    logger.log_edge_event(round_n, event_type, expresser_name, responder_name)
+                    # Held before update_edge may remove the edge, so the logged
+                    # decision reads the post-step valuation that crossed the floor.
+                    edge_data = state.graph[expresser_name][responder_name]["data"]
+                    severed_by = update_edge(state, expresser_name, responder_name)
+                    if severed_by is None:
+                        logger.log_edge_event(
+                            round_n, "edge_maintained", expresser_name, responder_name
+                        )
+                    else:
+                        dropped = (
+                            responder_name if severed_by == expresser_name else expresser_name
+                        )
+                        logger.log_edge_event(
+                            round_n, "edge_dropped", severed_by, dropped,
+                            signal_severed=round(
+                                rolling_signal(edge_data.reward_history[severed_by]), 4
+                            ),
+                            signal_other=round(
+                                rolling_signal(edge_data.reward_history[dropped]), 4
+                            ),
+                            strength_severed=round(edge_data.strengths[severed_by], 4),
+                            strength_other=round(edge_data.strengths[dropped], 4),
+                        )
+                        print(f"    ✂  {severed_by} dropped {dropped}")
 
-        # -- Reconnect isolated agents (GRAPH_DYNAMIC only) ---------------
-        if GRAPH_DYNAMIC:
-            ensure_connectivity(state)
+                        if REWIRE_RULE != "off":
+                            new_partner = rewire_after_drop(state, severed_by, dropped)
+                            if new_partner is None:
+                                logger.log_edge_event(
+                                    round_n, "rewire_failed", severed_by, dropped,
+                                    rule=REWIRE_RULE,
+                                )
+                                print(f"    ⚠️  {severed_by}: no candidate under "
+                                      f"REWIRE_RULE={REWIRE_RULE}; degree drops")
+                            else:
+                                logger.log_edge_event(
+                                    round_n, "edge_rewired", severed_by, new_partner,
+                                    replaced=dropped, rule=REWIRE_RULE,
+                                )
+                                print(f"    ↻  {severed_by} → {new_partner} (replaces {dropped})")
 
         # -- Reflection phase ---------------------------------------------
-        if round_n % REFLECT_EVERY == 0:
+        if MEMORY_ENABLED and round_n % REFLECT_EVERY == 0:
             print(f"\n-- Reflection phase (round {round_n}) --")
             for agent in agents.values():
-                agent.reflect(state.opinion_states[agent.name].argmax_stance)
+                agent.reflect(
+                    state.opinion_states[agent.name].argmax_stance,
+                    conviction_cue(state.opinion_states[agent.name],
+                                   state.opinion_states[agent.name].argmax_stance)
+                    if CONVICTION_CUE_ENABLED else None,
+                )
                 logger.log_reflection(round_n, agent.name)
 
         # -- Snapshot -----------------------------------------------------
