@@ -1,5 +1,0 @@
-langchain-ollama
-chromadb
-ollama
-networkx
-sentence-transformers

@@ -1,0 +1,11 @@
+# The local environment (Python 3.11.9) the notebooks, metrics.py and the benchmark run in.
+# The SCC's are ../simulation/requirements.txt.
+numpy==2.2.1
+pandas==3.0.2
+scipy==1.15.1
+matplotlib==3.10.0
+networkx==3.4.2
+jupyterlab==4.3.5
+nbconvert==7.16.6
+# agents.llm, imported by the audit's builder (its stub included)
+ollama==0.6.2
